@@ -40,6 +40,8 @@ from .importer.par_browser import (
     YKPAR_OT_import_par_armature,
     YKPAR_OT_import_par_animation,
     YKPAR_OT_relink_preserved_tmp,
+    YKPAR_OT_extract_textures_from_configured_par,
+    YKPAR_OT_extract_textures_from_par,
     YKPAR_OT_debug_dds_path,
     YKPAR_PT_browser,
 )
@@ -49,6 +51,8 @@ from .importer import par_browser as par_browser_module
 class YKPAR_PreferenceItem(PropertyGroup):
     """A single .par entry stored in addon preferences"""
     path: StringProperty(name="PAR Path", subtype='FILE_PATH')
+    # human-friendly short name (filename without extension)
+    name: StringProperty(name="Name", default="")
 
 
 class YKPAR_OT_add_par_file(Operator, ImportHelper):
@@ -67,6 +71,10 @@ class YKPAR_OT_add_par_file(Operator, ImportHelper):
             fp = os.path.join(base, f.name)
             item = prefs.par_files.add()
             item.path = fp
+            try:
+                item.name = os.path.splitext(os.path.basename(fp))[0]
+            except Exception:
+                item.name = fp
         return {'FINISHED'}
 
 
@@ -143,6 +151,8 @@ classes = (
     YKPAR_OT_import_par_armature,
     YKPAR_OT_import_par_animation,
     YKPAR_OT_relink_preserved_tmp,
+    YKPAR_OT_extract_textures_from_configured_par,
+    YKPAR_OT_extract_textures_from_par,
     YKPAR_OT_debug_dds_path,
     YKPAR_PT_browser,
     YakuzaPropertyGroup,

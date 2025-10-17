@@ -499,8 +499,47 @@ def _extract_matching_dds_to_temp(par_obj, names_set, gmd_internal_path: str = N
         return None
 
     if not extracted:
-        print(f"[yk_par_lib_tool] No matching DDS files extracted (no files written to configured path): {tmpdir}")
-        return None
+        # If nothing extracted from the provided PAR, attempt to search other
+        # loaded PARs in PAR_CACHE. This helps when GMD references textures
+        # that live in a different PAR file.
+        try:
+            found_elsewhere = False
+            scanned = []
+            # PAR_CACHE maps par_path -> root_folder (or None). Iterate and treat
+            # each value as a root folder to search for matching DDS files.
+            for cache_key, cache_root in PAR_CACHE.items():
+                try:
+                    # skip empty cache entries
+                    if not cache_root:
+                        continue
+                    # skip the original PAR's root folder to avoid re-scanning
+                    if 'rootf' in locals() and cache_root is rootf:
+                        continue
+                    scanned.append(cache_key)
+                    # walk the candidate root folder and try to extract matches into tmpdir
+                    try:
+                        walk_and_extract(cache_root, '')
+                    except Exception:
+                        pass
+                    if extracted:
+                        print(f"[yk_par_lib_tool] Found matching DDS files in another PAR cache entry: {cache_key}")
+                        found_elsewhere = True
+                        break
+                except Exception:
+                    # continue scanning other cache entries even if one fails
+                    continue
+
+            try:
+                print(f"[yk_par_lib_tool] Scanned {len(scanned)} other PARs for matches: {scanned}")
+            except Exception:
+                pass
+
+            if not found_elsewhere:
+                print(f"[yk_par_lib_tool] No matching DDS files extracted (no files written to configured path): {tmpdir}")
+                return None
+        except Exception:
+            print(f"[yk_par_lib_tool] No matching DDS files extracted (no files written to configured path): {tmpdir}")
+            return None
     print(f"[yk_par_lib_tool] DDS extraction complete. Files written to: {tmpdir}")
     return tmpdir
 
@@ -2350,6 +2389,7 @@ class YKPAR_PT_browser(Panel):
         row.operator('yk_par_lib_tool.refresh_par_listing', text='', icon='FILE_REFRESH')
         row.operator('yk_par_lib_tool.clear_par_filter', text='', icon='X')
         row.operator('yk_par_lib_tool.relink_preserved_tmp', text='Relink Textures')
+        row.operator('yk_par_lib_tool.extract_textures_from_configured_par', text='Extract Textures from Configured PAR')
         row.operator('yk_par_lib_tool.confirm_import_selected', text='Import Selected')
         row.operator('yk_par_lib_tool.import_visible_all', text='Import All')
 
@@ -2452,6 +2492,12 @@ class YKPAR_PT_browser(Panel):
                 folder_label = (prefix.split('/')[-2] + '/') if prefix else bpy.path.display_name_from_filepath(par_path)
                 # Place the folder label with icon in the middle column so the icon sits next to the text
                 mid_col.label(text=folder_label, icon='FILE_FOLDER')
+                # Add a small operator button to extract textures from this specific PAR
+                try:
+                    btn = right.operator('yk_par_lib_tool.extract_textures_from_par', text='', icon='IMAGE_DATA')
+                    btn.par_path = par_path
+                except Exception:
+                    pass
                 if is_exp:
                     # list files at this level
                     for f in getattr(folder, 'files', []) or []:
@@ -2492,6 +2538,174 @@ class YKPAR_PT_browser(Panel):
 
             for p, root in PAR_CACHE.items():
                 draw_folder(box, p, root, '', 0)
+
+class YKPAR_OT_extract_textures_from_configured_par(Operator):
+    """Extract DDS textures from the currently selected configured PAR in preferences and relink them."""
+    bl_idname = 'yk_par_lib_tool.extract_textures_from_configured_par'
+    bl_label = 'Extract Textures from Configured PAR'
+
+    def execute(self, context):
+        # Get configured prefs and active par index
+        prefs_addon = context.preferences.addons.get('yk_par_lib_tool')
+        if not prefs_addon or not getattr(prefs_addon, 'preferences', None):
+            self.report({'ERROR'}, 'yk_par_lib_tool preferences not found')
+            return {'CANCELLED'}
+        prefs = prefs_addon.preferences
+        idx = getattr(prefs, 'par_index', 0)
+        par_list = getattr(prefs, 'par_files', None)
+        if not par_list or len(par_list) == 0:
+            self.report({'ERROR'}, 'No configured PAR files found in preferences')
+            return {'CANCELLED'}
+        try:
+            par_entry = par_list[idx]
+            par_path = getattr(par_entry, 'path', None)
+        except Exception:
+            par_path = None
+        if not par_path or not os.path.exists(par_path):
+            self.report({'ERROR'}, f'Configured PAR path is invalid: {par_path}')
+            return {'CANCELLED'}
+
+        try:
+            par = read_par(par_path)
+        except Exception as e:
+            self.report({'ERROR'}, f'Failed to read PAR: {e}')
+            return {'CANCELLED'}
+
+        # Determine extraction dir using prefs (deterministic subdir)
+        try:
+            pref_path = getattr(prefs, 'dds_extract_path', '') or ''
+            if not pref_path:
+                self.report({'ERROR'}, 'DDS extract path not configured in add-on preferences')
+                return {'CANCELLED'}
+            tmpdir = _deterministic_extraction_subdir(pref_path, None, None, prefix='ykpar_dds_par_')
+        except Exception as e:
+            self.report({'ERROR'}, f'Failed to prepare extraction folder: {e}')
+            return {'CANCELLED'}
+
+        extracted = False
+
+        def walk_and_extract_for_par(folder, prefix):
+            nonlocal extracted
+            for f in getattr(folder, 'files', []) or []:
+                internal = (prefix + (f.name or '')).lstrip('/')
+                if not internal.lower().endswith('.dds'):
+                    continue
+                try:
+                    data = decompress_file(f) if getattr(f, 'compression', 0) else f.data
+                    if isinstance(data, (bytearray, memoryview)):
+                        data = bytes(data)
+                    out_path = _safe_write_bytes(tmpdir, f.name, data)
+                    extracted = True
+                except Exception:
+                    pass
+            for sub in getattr(folder, 'folders', []) or []:
+                walk_and_extract_for_par(sub, prefix + (sub.name or '') + '/')
+
+        try:
+            root = par.folders[0] if getattr(par, 'folders', None) and len(par.folders) else None
+            if not root:
+                self.report({'ERROR'}, 'PAR has no root')
+                return {'CANCELLED'}
+            walk_and_extract_for_par(root, '')
+        except Exception as e:
+            self.report({'ERROR'}, f'Failed during extraction: {e}')
+            return {'CANCELLED'}
+
+        if not extracted:
+            self.report({'WARNING'}, 'No DDS files found in configured PAR')
+            return {'CANCELLED'}
+
+        try:
+            # Attempt to relink images from the extraction directory
+            relinked = _relink_images_from_folder(tmpdir, overwrite_linked=True, case_sensitive=False)
+            self.report({'INFO'}, f'Extracted textures to {tmpdir}, relinked {relinked} images')
+        except Exception as e:
+            self.report({'WARNING'}, f'Extracted textures to {tmpdir} but relink failed: {e}')
+
+        try:
+            # Preserve the extracted folder for inspection
+            _register_preserved_tmp(tmpdir)
+        except Exception:
+            pass
+
+        return {'FINISHED'}
+
+
+
+class YKPAR_OT_extract_textures_from_par(Operator):
+    """Extract DDS textures from the specified PAR path and relink them."""
+    bl_idname = 'yk_par_lib_tool.extract_textures_from_par'
+    bl_label = 'Extract Textures from PAR'
+
+    par_path: StringProperty()
+
+    def execute(self, context):
+        par_path = getattr(self, 'par_path', None)
+        if not par_path or not os.path.exists(par_path):
+            self.report({'ERROR'}, f'Invalid PAR path: {par_path}')
+            return {'CANCELLED'}
+
+        try:
+            par = read_par(par_path)
+        except Exception as e:
+            self.report({'ERROR'}, f'Failed to read PAR: {e}')
+            return {'CANCELLED'}
+
+        # Use configured extraction preference
+        prefs_addon = context.preferences.addons.get('yk_par_lib_tool')
+        pref_path = ''
+        if prefs_addon and getattr(prefs_addon, 'preferences', None):
+            pref_path = getattr(prefs_addon.preferences, 'dds_extract_path', '') or ''
+        if not pref_path:
+            self.report({'ERROR'}, 'DDS extract path not configured in add-on preferences')
+            return {'CANCELLED'}
+
+        tmpdir = _deterministic_extraction_subdir(pref_path, None, None, prefix='ykpar_dds_par_')
+
+        extracted = False
+
+        def walk_and_extract_for_par(folder, prefix):
+            nonlocal extracted
+            for f in getattr(folder, 'files', []) or []:
+                if not (getattr(f, 'name', '') or '').lower().endswith('.dds'):
+                    continue
+                try:
+                    data = decompress_file(f) if getattr(f, 'compression', 0) else f.data
+                    if isinstance(data, (bytearray, memoryview)):
+                        data = bytes(data)
+                    _safe_write_bytes(tmpdir, f.name, data)
+                    extracted = True
+                except Exception:
+                    pass
+            for sub in getattr(folder, 'folders', []) or []:
+                walk_and_extract_for_par(sub, prefix + (sub.name or '') + '/')
+
+        try:
+            root = par.folders[0] if getattr(par, 'folders', None) and len(par.folders) else None
+            if not root:
+                self.report({'ERROR'}, 'PAR has no root')
+                return {'CANCELLED'}
+            walk_and_extract_for_par(root, '')
+        except Exception as e:
+            self.report({'ERROR'}, f'Failed extracting from PAR: {e}')
+            return {'CANCELLED'}
+
+        if not extracted:
+            self.report({'WARNING'}, 'No DDS files found in the specified PAR')
+            return {'CANCELLED'}
+
+        try:
+            relinked = _relink_images_from_folder(tmpdir, overwrite_linked=True, case_sensitive=False)
+            self.report({'INFO'}, f'Extracted textures to {tmpdir}, relinked {relinked} images')
+        except Exception as e:
+            self.report({'WARNING'}, f'Extracted textures to {tmpdir} but relink failed: {e}')
+
+        try:
+            _register_preserved_tmp(tmpdir)
+        except Exception:
+            pass
+
+        return {'FINISHED'}
 
 
 class YKPAR_OT_import_visible_all(BaseImportGMD, Operator):
