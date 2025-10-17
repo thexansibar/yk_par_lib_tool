@@ -3,7 +3,7 @@
 This is a tool that unpacks PARs and allows for .gmd import directly from within blender, no partool required!
 
 Uses gmd-io baked in, thanks TurboTurnip for the io functionality and NotYoshi for Neo Yakuza Shader
-
+<img width="398" height="578" alt="image" src="https://github.com/user-attachments/assets/4a174ba6-e1f7-4a37-b90c-a45ab4e7063a" />
 ## What this does:
 1. Select a .par of your choosing, and it will unpack and display a file hierarchy that you can sift through manually or search directly for the gmd you want.
 2. when you select a .gmd you want, it will import and create a folder and only import the textures that are linked to the related gmd. (they will autolink!) They also come with their _l counterparts.
