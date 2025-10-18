@@ -27,10 +27,31 @@ class GMDUnskinnedSceneCreator(BaseGMDSceneCreator):
             self.error.recoverable(
                 f"This import method cannot import skinnned objects. Please use the [Skinned] variant")
 
-    def make_objects(self, collection: bpy.types.Collection):
+    def make_objects(self, *args, **kwargs):
         """
-        Populate the Blender scene with Blender objects for each node in the scene hierarchy
-        representing a GMDUnskinnedObject.
+        Backwards-compatible wrapper for make_objects.
+        Some callers invoke make_objects(collection) while others pass (context, collection[, ...]).
+        Normalize the arguments and dispatch to the real implementation `_make_objects_impl`.
+        """
+
+        # Support either (collection) or (context, collection, ...)
+        if len(args) == 1:
+            collection = args[0]
+        elif len(args) >= 2:
+            # args[0] is context, args[1] is collection
+            collection = args[1]
+        else:
+            collection = kwargs.get('collection')
+
+        if collection is None:
+            raise TypeError("make_objects requires a collection argument")
+
+        return self._make_objects_impl(collection)
+
+    def _make_objects_impl(self, collection: bpy.types.Collection):
+        """
+        Actual implementation that populates the Blender scene with objects for each node in the
+        scene hierarchy representing a GMDUnskinnedObject.
         :param collection: The collection the import process is adding objects and meshes to.
         :return: Nothing
         """

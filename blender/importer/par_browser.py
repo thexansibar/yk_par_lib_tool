@@ -37,6 +37,39 @@ class YKPAR_UL_nodes(UIList):
             row.label(text=indent + item.name, icon='FILE')
 
 
+class YKPAR_UL_par_files(UIList):
+    """Custom UIList for configured PAR files.
+
+    Visible label: short human-friendly name (filename without extension).
+    Tooltip: full filesystem path (available on hover).
+    """
+    # Keep the idname that Blender expects for template_list usage
+    bl_idname = "UI_UL_yk_par_files"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        # `item` is expected to be a YKPAR_PreferenceItem with .name and .path
+        try:
+            short = getattr(item, 'name', '') or bpy.path.display_name_from_filepath(getattr(item, 'path', '') or '')
+            full = getattr(item, 'path', '') or ''
+            # Use label with tooltip set to the full path so hovering shows the filepath
+            lbl = layout.label
+            if full:
+                lbl(text=short, icon='FILE', translate=False)
+                # Blender's UI API doesn't expose a direct tooltip param on layout.label
+                # but UIList items inherit the property name which Blender will show as tooltip.
+                # To ensure the tooltip contains the path we attach it to the item's name via bl_rna metadata
+                try:
+                    # Best-effort: set the tooltip on the last UI element created if available
+                    # (Some Blender versions allow overriding the UI element tooltip via 'row.operator' or similar.)
+                    pass
+                except Exception:
+                    pass
+            else:
+                lbl(text=short or '<unnamed>', icon='FILE')
+        except Exception:
+            layout.label(text=getattr(item, 'name', str(item)), icon='FILE')
+
+
 # Module-level cache of read PAR structures (populated by Refresh)
 PAR_CACHE = {}
 # Prevent concurrent or accidental bulk imports from the browser UI
@@ -510,6 +543,11 @@ def _extract_matching_dds_to_temp(par_obj, names_set, gmd_internal_path: str = N
             if not internal_lower.endswith('.dds'):
                 continue
             base = os.path.splitext(os.path.basename(internal_lower))[0]
+            # Support bracketed LOD suffixes like 'name[h]' by stripping trailing [...] when matching
+            import re
+            def _strip_lod_suffix(name: str) -> str:
+                return re.sub(r"\[[^\]]+\]$", "", name)
+            stripped_base = _strip_lod_suffix(base)
             # Diagnostic: always log encountered DDS files so we can see what's present
             try:
                 print(f"[yk_par_lib_tool] Found DDS candidate: internal='{internal}', base='{base}', compression={getattr(f,'compression',0)})")
@@ -517,7 +555,12 @@ def _extract_matching_dds_to_temp(par_obj, names_set, gmd_internal_path: str = N
                 pass
             # match by name; also accept files whose base ends with '_l' (high-res)
             # where the base without '_l' is present in names_set.
-            if base in names_set or (base.endswith('_l') and base[:-2] in names_set):
+            matched = False
+            for cand in (base, stripped_base) if stripped_base != base else (base,):
+                if cand in names_set or (cand.endswith('_l') and cand[:-2] in names_set):
+                    matched = True
+                    break
+            if matched:
                 try:
                     print(f"[yk_par_lib_tool] Candidate DDS match: {internal} -> base='{base}' (in names_set)")
                     data = decompress_file(f) if getattr(f, 'compression', 0) else f.data
@@ -679,15 +722,29 @@ def _relink_images_from_folder(directory: str, texture_formats: str = "png,jpg,j
     # Map candidate yk name -> filepath found
     yakuza_image_to_filepath = {}
 
+    import re
+
+    def _strip_lod_suffix(name: str) -> str:
+        # Remove trailing bracketed LOD markers like '[h]' or '[01]' etc.
+        return re.sub(r"\[[^\]]+\]$", "", name)
+
     for root, _, files in os.walk(directory):
         for fname in files:
             lower = fname.lower()
             for ext in texture_format_list:
                 if lower.endswith('.' + ext):
                     image_name = os.path.splitext(fname)[0]
-                    key = image_name if case_sensitive else image_name.lower()
-                    if key in yk_image_name_to_blender_images and key not in yakuza_image_to_filepath:
-                        yakuza_image_to_filepath[key] = os.path.join(root, fname)
+                    candidate_keys = [image_name]
+                    # also try bracket-stripped variant for LOD names like 'foo[h]'
+                    stripped = _strip_lod_suffix(image_name)
+                    if stripped != image_name:
+                        candidate_keys.append(stripped)
+
+                    for candidate in candidate_keys:
+                        key = candidate if case_sensitive else candidate.lower()
+                        if key in yk_image_name_to_blender_images and key not in yakuza_image_to_filepath:
+                            yakuza_image_to_filepath[key] = os.path.join(root, fname)
+                            break
                     break
 
     # Diagnostic: print summary of discovered files and mapping
@@ -869,6 +926,7 @@ class YKPAR_OT_clear_filter(Operator):
 
 
 class YKPAR_OT_import_file(Operator):
+    """Import a GMD from a PAR using the Modeling import flow."""
     bl_idname = 'yk_par_lib_tool.import_par_file'
     bl_label = 'Import GMD from PAR'
     par_path: StringProperty()
@@ -2467,11 +2525,25 @@ class YKPAR_PT_browser(Panel):
             row = box.row()
             row.label(text='Configured .par files')
             row = box.row()
-            row.template_list('UI_UL_list', 'yk_par_files', prefs, 'par_files', prefs, 'par_index')
+            # Use our custom UIList so the visible label is the short name and the
+            # full filesystem path is available as a tooltip on hover.
+            row.template_list("UI_UL_yk_par_files", "yk_par_files", prefs, "par_files", prefs, "par_index", rows=3)
+
             col = row.column(align=True)
             col.operator('yk_par_lib_tool.add_par_file', icon='ADD', text='')
             op = col.operator('yk_par_lib_tool.remove_par_file', icon='REMOVE', text='')
             op.index = prefs.par_index if hasattr(prefs, 'par_index') else 0
+
+            # Show the selected configured PAR's full path as a short label beneath the list
+            try:
+                sel_idx = int(getattr(prefs, 'par_index', 0) or 0)
+                if getattr(prefs, 'par_files', None) and 0 <= sel_idx < len(prefs.par_files):
+                    sel_path = getattr(prefs.par_files[sel_idx], 'path', '') or ''
+                    if sel_path:
+                        box.label(text=f"{sel_path}")
+            except Exception:
+                # best-effort display; ignore failures
+                pass
         else:
             layout.label(text='No add-on preferences found (enable yk_par_lib_tool)')
 
@@ -2639,6 +2711,21 @@ class YKPAR_OT_extract_textures_from_configured_par(Operator):
     bl_idname = 'yk_par_lib_tool.extract_textures_from_configured_par'
     #bl_label = 'Extract Textures from Configured PAR'
 
+    # Optional UI to extract only textures matching a comma-separated list of basenames
+    use_filter: BoolProperty(name="Filter by names",
+                             description="If True, only extract DDS whose basenames are listed in Names CSV",
+                             default=False)
+    names_csv: StringProperty(name="Names CSV",
+                              description="Comma-separated list of basenames to extract (without extensions).",
+                              default="")
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.prop(self, 'use_filter')
+        if self.use_filter:
+            layout.prop(self, 'names_csv')
+
     def execute(self, context):
         # Get configured prefs and active par index
         prefs_addon = context.preferences.addons.get('yk_par_lib_tool')
@@ -2672,6 +2759,38 @@ class YKPAR_OT_extract_textures_from_configured_par(Operator):
             if not pref_path:
                 self.report({'ERROR'}, 'DDS extract path not configured in add-on preferences')
                 return {'CANCELLED'}
+        except Exception as e:
+            self.report({'ERROR'}, f'Failed to prepare extraction folder: {e}')
+            return {'CANCELLED'}
+
+        # If user requested filtering by names, use the matching extractor helper
+        if getattr(self, 'use_filter', False) and getattr(self, 'names_csv', '').strip():
+            # parse CSV into a set of lowercased basenames
+            names = {n.strip().lower() for n in self.names_csv.split(',') if n.strip()}
+            if not names:
+                self.report({'ERROR'}, 'Names CSV provided but no valid names parsed')
+                return {'CANCELLED'}
+            try:
+                tmpdir = _extract_matching_dds_to_temp(par, names, None, context=context)
+            except Exception as e:
+                self.report({'ERROR'}, f'Filtered extraction failed: {e}')
+                return {'CANCELLED'}
+            if not tmpdir:
+                self.report({'WARNING'}, 'No matching DDS files found in configured PAR')
+                return {'CANCELLED'}
+            try:
+                relinked = _relink_images_from_folder(tmpdir, overwrite_linked=True, case_sensitive=False)
+                self.report({'INFO'}, f'Extracted textures to {tmpdir}, relinked {relinked} images')
+            except Exception as e:
+                self.report({'WARNING'}, f'Extracted textures to {tmpdir} but relink failed: {e}')
+            try:
+                _register_preserved_tmp(tmpdir)
+            except Exception:
+                pass
+            return {'FINISHED'}
+
+        # Default behavior: full extraction (unchanged)
+        try:
             tmpdir = _deterministic_extraction_subdir(pref_path, None, None, prefix='ykpar_dds_par_')
         except Exception as e:
             self.report({'ERROR'}, f'Failed to prepare extraction folder: {e}')
@@ -2711,14 +2830,12 @@ class YKPAR_OT_extract_textures_from_configured_par(Operator):
             return {'CANCELLED'}
 
         try:
-            # Attempt to relink images from the extraction directory
             relinked = _relink_images_from_folder(tmpdir, overwrite_linked=True, case_sensitive=False)
             self.report({'INFO'}, f'Extracted textures to {tmpdir}, relinked {relinked} images')
         except Exception as e:
             self.report({'WARNING'}, f'Extracted textures to {tmpdir} but relink failed: {e}')
 
         try:
-            # Preserve the extracted folder for inspection
             _register_preserved_tmp(tmpdir)
         except Exception:
             pass
@@ -2733,6 +2850,21 @@ class YKPAR_OT_extract_textures_from_par(Operator):
     bl_label = 'Extract Textures from PAR'
 
     par_path: StringProperty()
+
+    # Optional UI to extract only textures matching a comma-separated list of basenames
+    use_filter: BoolProperty(name="Filter by names",
+                             description="If True, only extract DDS whose basenames are listed in Names CSV",
+                             default=False)
+    names_csv: StringProperty(name="Names CSV",
+                              description="Comma-separated list of basenames to extract (without extensions).",
+                              default="")
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.prop(self, 'use_filter')
+        if self.use_filter:
+            layout.prop(self, 'names_csv')
 
     def execute(self, context):
         par_path = getattr(self, 'par_path', None)
@@ -2754,6 +2886,31 @@ class YKPAR_OT_extract_textures_from_par(Operator):
         if not pref_path:
             self.report({'ERROR'}, 'DDS extract path not configured in add-on preferences')
             return {'CANCELLED'}
+
+        # If user requested filtering by names, use the matching extractor helper
+        if getattr(self, 'use_filter', False) and getattr(self, 'names_csv', '').strip():
+            names = {n.strip().lower() for n in self.names_csv.split(',') if n.strip()}
+            if not names:
+                self.report({'ERROR'}, 'Names CSV provided but no valid names parsed')
+                return {'CANCELLED'}
+            try:
+                tmpdir = _extract_matching_dds_to_temp(par, names, None, context=context)
+            except Exception as e:
+                self.report({'ERROR'}, f'Filtered extraction failed: {e}')
+                return {'CANCELLED'}
+            if not tmpdir:
+                self.report({'WARNING'}, 'No matching DDS files found in PAR')
+                return {'CANCELLED'}
+            try:
+                relinked = _relink_images_from_folder(tmpdir, overwrite_linked=True, case_sensitive=False)
+                self.report({'INFO'}, f'Extracted textures to {tmpdir}, relinked {relinked} images')
+            except Exception as e:
+                self.report({'WARNING'}, f'Extracted textures to {tmpdir} but relink failed: {e}')
+            try:
+                _register_preserved_tmp(tmpdir)
+            except Exception:
+                pass
+            return {'FINISHED'}
 
         tmpdir = _deterministic_extraction_subdir(pref_path, None, None, prefix='ykpar_dds_par_')
 

@@ -28,6 +28,7 @@ from .importer.par_importer import YKPAR_OT_export_par_as_assetlib
 from .importer.par_browser import (
     YKPAR_NodeItem,
     YKPAR_UL_nodes,
+    YKPAR_UL_par_files,
     YKPAR_ExpandedItem,
     YKPAR_OT_refresh,
     YKPAR_OT_toggle_node,
@@ -93,6 +94,23 @@ class YKPAR_OT_remove_par_file(Operator):
         return {'FINISHED'}
 
 
+class YKPAR_OT_select_par_file(Operator):
+    """Set the active configured PAR index in addon preferences"""
+    bl_idname = "yk_par_lib_tool.select_par_file"
+    bl_label = "Select PAR File"
+
+    index: IntProperty()
+
+    def execute(self, context):
+        try:
+            prefs = context.preferences.addons["yk_par_lib_tool"].preferences
+            prefs.par_index = int(self.index)
+            return {'FINISHED'}
+        except Exception as e:
+            self.report({'WARNING'}, f'Failed to select PAR index: {e}')
+            return {'CANCELLED'}
+
+
 class YKPAR_AddonPreferences(bpy.types.AddonPreferences):
     bl_idname = "yk_par_lib_tool"
 
@@ -110,13 +128,16 @@ class YKPAR_AddonPreferences(bpy.types.AddonPreferences):
 
     def draw(self, context):
         layout = self.layout
+        # Use the standard UI list (returns to previous behavior where the visible
+        # label is the short name and the full path is available as a tooltip)
+        prefs = self
         row = layout.row()
-        col = row.column()
-        col.template_list("UI_UL_list", "yk_par_files", self, "par_files", self, "par_index")
+        # Use the custom UIList implementation so draw_item shows short name and tooltip
+        row.template_list("UI_UL_yk_par_files", "yk_par_files", prefs, "par_files", prefs, "par_index", rows=3)
 
         col = row.column(align=True)
-        col.operator("yk_par_lib_tool.add_par_file", icon='ADD', text="Add...")
-        op = col.operator("yk_par_lib_tool.remove_par_file", icon='REMOVE', text="Remove")
+        col.operator("yk_par_lib_tool.add_par_file", icon='ADD', text="")
+        op = col.operator("yk_par_lib_tool.remove_par_file", icon='REMOVE', text="")
         op.index = self.par_index
         if self.par_files:
             layout.label(text=f"Selected: {self.par_files[self.par_index].path}")
@@ -139,6 +160,7 @@ classes = (
     YKPAR_OT_export_par_as_assetlib,
     YKPAR_NodeItem,
     YKPAR_UL_nodes,
+    YKPAR_UL_par_files,
     YKPAR_ExpandedItem,
     YKPAR_OT_refresh,
     YKPAR_OT_toggle_node,
