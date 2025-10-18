@@ -221,6 +221,57 @@ def _deterministic_extraction_subdir(base_path: str, gmd_internal_path: str = No
         return base_path
 
 
+def _write_gmd_to_extraction(file_bytes: bytes, gmd_filename: str, tmpdir: str = None, gmd_internal_path: str = None, names_set=None, context=None):
+    """Write the .gmd file to the extraction directory. If tmpdir is provided use it; otherwise try to resolve the add-on preference and create a deterministic subfolder.
+
+    Returns the written filepath or None on failure.
+    """
+    if not file_bytes:
+        return None
+    # prefer provided tmpdir
+    out_dir = tmpdir
+    try:
+        if not out_dir:
+            # Try preference-first resolution
+            prefs_addon = getattr(bpy.context.preferences.addons.get('yk_par_lib_tool'), 'preferences', None)
+            pref_path = getattr(prefs_addon, 'dds_extract_path', '') or '' if prefs_addon else ''
+            if pref_path:
+                try:
+                    # Use the same deterministic subdir naming as the DDS extractor when possible
+                    out_dir = _deterministic_extraction_subdir(pref_path, gmd_internal_path, names_set, prefix='ykpar_dds_match_')
+                except Exception:
+                    out_dir = pref_path
+            else:
+                # No preference configured — nothing to do (do not create temp dirs)
+                return None
+    except Exception:
+        return None
+
+    # ensure filename ends with .gmd
+    fn = gmd_filename
+    if not fn.lower().endswith('.gmd'):
+        fn = fn + '.gmd'
+
+    try:
+        target_path = os.path.join(out_dir, fn)
+        # If the target already exists, skip writing to avoid duplicates/overwrites
+        try:
+            if os.path.exists(target_path):
+                try:
+                    print(f"[yk_par_lib_tool] Skipping duplicate GMD (exists): {target_path}")
+                except Exception:
+                    pass
+                return target_path
+        except Exception:
+            # if os.path.exists fails for any reason, fall back to attempting write
+            pass
+
+        dest = _safe_write_bytes(out_dir, fn, file_bytes)
+        return dest
+    except Exception:
+        return None
+
+
 def _safe_write_bytes(directory: str, filename: str, data: bytes) -> str:
     """Write bytes to directory with name collision handling. Returns final path."""
     # Entry debug: show what the caller passed in
@@ -347,8 +398,19 @@ def _extract_dds_hires_to_temp(par_obj, gmd_internal_path: str = None, context=N
                     data = decompress_file(f) if getattr(f, 'compression', 0) else f.data
                     if isinstance(data, (bytearray, memoryview)):
                         data = bytes(data)
-                    out_path = _safe_write_bytes(tmpdir, f.name, data)
-                    extracted = True
+                    try:
+                        target_candidate = os.path.join(tmpdir, f.name)
+                        if os.path.exists(target_candidate):
+                            try:
+                                print(f"[yk_par_lib_tool] Skipping duplicate DDS (exists): {target_candidate}")
+                            except Exception:
+                                pass
+                        else:
+                            out_path = _safe_write_bytes(tmpdir, f.name, data)
+                            extracted = True
+                    except Exception:
+                        # ignore individual failures
+                        pass
                 except Exception:
                     # ignore individual failures
                     pass
@@ -471,8 +533,19 @@ def _extract_matching_dds_to_temp(par_obj, names_set, gmd_internal_path: str = N
                         print(f"WARNING: Skipping DDS file '{f.name}' -- missing DDS header magic or header too short.")
                         print(f"Header dump: {data[:32].hex()}")
                         continue
-                    out_path = _safe_write_bytes(tmpdir, f.name, data)
-                    print(f"Extracted DDS file '{f.name}' ({dds_size} bytes)")
+                    try:
+                        target_candidate = os.path.join(tmpdir, f.name)
+                        if os.path.exists(target_candidate):
+                            try:
+                                print(f"[yk_par_lib_tool] Skipping duplicate DDS (exists): {target_candidate}")
+                            except Exception:
+                                pass
+                        else:
+                            out_path = _safe_write_bytes(tmpdir, f.name, data)
+                            print(f"Extracted DDS file '{f.name}' ({dds_size} bytes)")
+                    except Exception:
+                        # ignore individual failures
+                        pass
                     # Convert DDS to PNG using Pillow
                     try:
                         img = Image.open(out_path)
@@ -904,6 +977,17 @@ class YKPAR_OT_import_file(Operator):
                     tmp_dir = _extract_matching_dds_to_temp(par, names_set, internal, context=context)
                 except Exception:
                     tmp_dir = None
+
+            # Attempt to write the original .gmd file to the same extraction folder for modding
+            try:
+                try:
+                    written = _write_gmd_to_extraction(file_bytes, target.name, tmp_dir, internal, names_set, context=context)
+                    if written:
+                        print(f"[yk_par_lib_tool] Wrote GMD to extraction folder: {written}")
+                except Exception:
+                    pass
+            except Exception:
+                pass
 
             # If we have an extraction dir, attempt relink (the relink helper will prefer the user preference)
             if tmp_dir:
@@ -1407,6 +1491,14 @@ class YKPAR_OT_import_file(Operator):
                                 walk_and_extract(sub)
                         if rootf:
                             walk_and_extract(rootf)
+
+                        # After extraction, write the .gmd into the same extraction folder when possible
+                        try:
+                            written = _write_gmd_to_extraction(file_bytes, target.name, tmp_dir, internal, names_set, context=context)
+                            if written:
+                                print(f"[yk_par_lib_tool] Wrote GMD to extraction folder: {written}")
+                        except Exception:
+                            pass
                     except Exception:
                         tmp_dir = None
 
@@ -1837,7 +1929,7 @@ class YKPAR_OT_place_file(Operator):
 class YKPAR_OT_relink_preserved_tmp(Operator):
     """Relink images from the most recently preserved extraction temp directory."""
     bl_idname = 'yk_par_lib_tool.relink_preserved_tmp'
-    bl_label = 'Relink Textures'
+    # bl_label = 'Relink Textures' # Not in Use
 
     def execute(self, context):
         # If the user configured a DDS extract path, use it exclusively for relinking
@@ -1988,8 +2080,8 @@ def _is_allowed_top_level(name: str) -> bool:
 
 class YKPAR_OT_refresh(Operator):
     bl_idname = "yk_par_lib_tool.refresh_par_listing"
-    bl_label = "Refresh PAR Listing"
-    bl_description = "Refresh the PAR browser listing. Use the Filter field to only show matching files/folders."
+    bl_label = "Unpack Loaded PARs"
+    bl_description = "Unpack configured PAR files and refresh the browser so their contents are available. Use the Filter field to narrow results."
 
     def execute(self, context):
         scene = context.scene
@@ -2386,12 +2478,13 @@ class YKPAR_PT_browser(Panel):
         # Search/filter row: text field + refresh + clear actions
         row = layout.row(align=True)
         row.prop(scene, 'yk_par_filter', text='', icon='VIEWZOOM')
-        row.operator('yk_par_lib_tool.refresh_par_listing', text='', icon='FILE_REFRESH')
+        # More prominent: unpack loaded PARs with a labeled button
+        row.operator('yk_par_lib_tool.refresh_par_listing', text='Unpack Loaded PARs', icon='PACKAGE')
         row.operator('yk_par_lib_tool.clear_par_filter', text='', icon='X')
         row.operator('yk_par_lib_tool.relink_preserved_tmp', text='Relink Textures')
         row.operator('yk_par_lib_tool.extract_textures_from_configured_par', text='Extract Textures from Configured PAR')
         row.operator('yk_par_lib_tool.confirm_import_selected', text='Import Selected')
-        row.operator('yk_par_lib_tool.import_visible_all', text='Import All')
+        #row.operator('yk_par_lib_tool.import_visible_all', text='Import All')
 
         # Render hierarchical tree from PAR_CACHE (or render filtered flat node list when a filter is active)
         box = layout.box()
@@ -2429,8 +2522,9 @@ class YKPAR_PT_browser(Panel):
                     # Create a small horizontal row for the three import buttons
                     try:
                         act_row = right.row(align=True)
-                        act_row.scale_x = 2
-                        act_row.scale_y = 0.85
+                        # Increase horizontal scale so the three import icons are wider and easier to click
+                        act_row.scale_x = 2.5
+                        act_row.scale_y = 0.95
                     except Exception:
                         act_row = right.row(align=True)
 
@@ -2516,8 +2610,9 @@ class YKPAR_PT_browser(Panel):
                         midf_col.label(text=f.name, icon='FILE')
                         try:
                             act_rowf = rightf.row(align=True)
-                            act_rowf.scale_x = 0.8
-                            act_rowf.scale_y = 0.85
+                            # Match the wider scale in folder listing for consistency
+                            act_rowf.scale_x = 2.0
+                            act_rowf.scale_y = 0.95
                         except Exception:
                             act_rowf = rightf.row(align=True)
 
@@ -2542,7 +2637,7 @@ class YKPAR_PT_browser(Panel):
 class YKPAR_OT_extract_textures_from_configured_par(Operator):
     """Extract DDS textures from the currently selected configured PAR in preferences and relink them."""
     bl_idname = 'yk_par_lib_tool.extract_textures_from_configured_par'
-    bl_label = 'Extract Textures from Configured PAR'
+    #bl_label = 'Extract Textures from Configured PAR'
 
     def execute(self, context):
         # Get configured prefs and active par index
