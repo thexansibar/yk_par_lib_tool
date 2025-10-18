@@ -17,7 +17,7 @@ Uses gmd-io baked in, thanks TurboTurnip for the io functionality and NotYoshi f
 2. let me know what you think and provide feedback on the ui, speed, and ease of use.
 
 
-Special Thanks to:
-@Ret-HZ for the idea to utilize the Python PAR reader by @mosamadeeb
-@theturboturnip for the IO that reads and imports the GMDs 
-@NotYoshi for Neo Yakuza for easy texture linking
+### Special Thanks to:
+- @Ret-HZ for the idea to utilize the Python PAR reader by @mosamadeeb
+- @theturboturnip for the IO that reads and imports the GMDs 
+- @NotYoshi for Neo Yakuza for easy texture linking
