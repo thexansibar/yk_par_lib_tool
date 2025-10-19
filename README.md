@@ -9,15 +9,14 @@ Uses gmd-io baked in, thanks TurboTurnip for the io functionality and NotYoshi f
 2. when you select a .gmd you want, it will import and create a folder and only import the textures that are linked to the related gmd. (they will autolink!) They also come with their _l counterparts.
 3. done!
 
-## What it cannot do:
-1. import the face_target.gmts (also to-do)
-
 ## What I need from you:
 1. Test it out! I know this is not a perfect tool but with your input i can fix the problems as they develop.
 2. let me know what you think and provide feedback on the ui, speed, and ease of use.
 
 
 ### Special Thanks to:
-- @Ret-HZ for the idea to utilize the Python PAR reader by @mosamadeeb
-- @theturboturnip for the IO that reads and imports the GMDs 
-- @NotYoshi for Neo Yakuza for easy texture linking
+@Ret-HZ for the idea to utilize the Python PAR reader by @mosamadeeb
+@theturboturnip for the IO that reads and imports the GMDs 
+@NotYoshi for Neo Yakuza for easy texture linking
+@Fronklin (Jhrino) and @sutandotsukai181 for .gmt import / export functionality.
+@Mugen for testing

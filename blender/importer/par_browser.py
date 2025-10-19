@@ -454,7 +454,16 @@ def _extract_dds_hires_to_temp(par_obj, gmd_internal_path: str = None, context=N
     try:
         rootf = par_obj.folders[0] if getattr(par_obj, 'folders', None) and len(par_obj.folders) else None
         if rootf:
-            walk_and_extract(rootf, '')
+            # Try nested-aware extraction first (handles embedded PARs)
+            try:
+                found = _extract_dds_from_par_object(par_obj, tmpdir, names_set=None, gmd_internal_path=gmd_internal_path, context=context)
+                if not found:
+                    walk_and_extract(rootf, '')
+                else:
+                    extracted = True
+            except Exception:
+                # Fallback to original walk if nested-aware extraction fails
+                walk_and_extract(rootf, '')
     except Exception as e:
         import traceback
         print(f"ERROR: Exception while extracting DDS hires: {e}")
@@ -468,6 +477,131 @@ def _extract_dds_hires_to_temp(par_obj, gmd_internal_path: str = None, context=N
     # If preference is set the tmpdir will be that path; inform user explicitly
     print(f"[yk_par_lib_tool] DDS hires extraction complete. Files written to: {tmpdir}")
     return tmpdir
+
+
+def _extract_dds_from_par_object(par_obj, tmpdir, names_set=None, gmd_internal_path: str = None, context=None, visited_signatures=None):
+    """Recursively extract DDS files from a Par object, including nested PAR files contained inside entries.
+
+    - par_obj: the top-level Par object (as returned by read_par())
+    - tmpdir: destination folder to write extracted files
+    - names_set: optional set of basenames to match (lowercased) when extracting. If None, extract all DDS.
+    - visited_signatures: set used to avoid infinite recursion when encountering the same embedded PAR bytes
+    Returns True if any files were extracted.
+    """
+    extracted = False
+    if visited_signatures is None:
+        visited_signatures = set()
+
+    def _strip_lod_suffix(name: str) -> str:
+        import re
+        return re.sub(r"\[[^\]]+\]$", "", name)
+
+    def process_folder(folder, prefix):
+        nonlocal extracted
+        # process files
+        for f in getattr(folder, 'files', []) or []:
+            name = (f.name or '')
+            internal = (prefix + name).lstrip('/')
+            lower = internal.lower()
+            if not lower.endswith('.dds'):
+                    # Not a DDS: check if it's a nested PAR (by extension or magic)
+                    try:
+                        # Get raw bytes (decompress if needed)
+                        data = decompress_file(f) if getattr(f, 'compression', 0) else f.data
+                        if isinstance(data, (bytearray, memoryview)):
+                            data = bytes(data)
+                        # Detect embedded PAR by name or magic
+                        is_par_candidate = False
+                        if name.lower().endswith('.par'):
+                            is_par_candidate = True
+                        elif data and len(data) >= 4 and data[:4] == b'PARC':
+                            is_par_candidate = True
+
+                        if is_par_candidate:
+                            # compute signature to avoid reprocessing identical embedded PARs
+                            try:
+                                sig = hashlib.sha1(data).hexdigest()
+                            except Exception:
+                                sig = None
+                            if sig and sig in visited_signatures:
+                                # already processed
+                                continue
+                            # write embedded par to a temp file inside tmpdir
+                            try:
+                                tmp_par_path = os.path.join(tmpdir, f"embedded_{sig or hashlib.sha1(name.encode('utf-8')).hexdigest()}.par")
+                                try:
+                                    print(f"[yk_par_lib_tool] Detected embedded PAR candidate: name='{name}', sig='{sig}', tmp_par_path='{tmp_par_path}'")
+                                except Exception:
+                                    pass
+                                with open(tmp_par_path, 'wb') as tf:
+                                    tf.write(data)
+                                # read it as a Par and recurse
+                                try:
+                                    nested = None
+                                    try:
+                                        nested = read_par(tmp_par_path)
+                                    except Exception:
+                                        nested = None
+                                    if nested:
+                                        try:
+                                            print(f"[yk_par_lib_tool] Successfully read embedded PAR: {tmp_par_path}")
+                                        except Exception:
+                                            pass
+                                        if sig:
+                                            visited_signatures.add(sig)
+                                        rootf = nested.folders[0] if getattr(nested, 'folders', None) and len(nested.folders) else None
+                                        if rootf:
+                                            process_folder(rootf, '')
+                                except Exception:
+                                    pass
+                            except Exception:
+                                pass
+                        continue
+                    except Exception:
+                        # ignore per-file failures when probing non-DDS entries
+                        pass
+
+            # it's a DDS file
+            base = os.path.splitext(os.path.basename(lower))[0]
+            stripped_base = _strip_lod_suffix(base)
+            matched = False
+            if names_set:
+                for cand in (base, stripped_base) if stripped_base != base else (base,):
+                    if cand in names_set or (cand.endswith('_l') and cand[:-2] in names_set):
+                        matched = True
+                        break
+                if not matched:
+                    continue
+
+                # decompress if needed and write
+                try:
+                    data = decompress_file(f) if getattr(f, 'compression', 0) else f.data
+                    if isinstance(data, (bytearray, memoryview)):
+                        data = bytes(data)
+                    target_candidate = os.path.join(tmpdir, f.name)
+                    if os.path.exists(target_candidate):
+                        try:
+                            print(f"[yk_par_lib_tool] Skipping duplicate DDS (exists): {target_candidate}")
+                        except Exception:
+                            pass
+                    else:
+                        _safe_write_bytes(tmpdir, f.name, data)
+                        extracted = True
+                except Exception:
+                    pass
+
+        # recurse into subfolders
+        for sub in getattr(folder, 'folders', []) or []:
+            process_folder(sub, prefix + (sub.name or '') + '/')
+
+    try:
+        root = par_obj.folders[0] if getattr(par_obj, 'folders', None) and len(par_obj.folders) else None
+        if root:
+            process_folder(root, '')
+    except Exception:
+        return False
+
+    return extracted
 
 
 def _extract_matching_dds_to_temp(par_obj, names_set, gmd_internal_path: str = None, context=None):
@@ -606,7 +740,16 @@ def _extract_matching_dds_to_temp(par_obj, names_set, gmd_internal_path: str = N
     try:
         rootf = par_obj.folders[0] if getattr(par_obj, 'folders', None) and len(par_obj.folders) else None
         if rootf:
-            walk_and_extract(rootf, '')
+            # Try nested-aware extraction first (handles embedded PARs)
+            try:
+                found = _extract_dds_from_par_object(par_obj, tmpdir, names_set=names_set, gmd_internal_path=gmd_internal_path, context=context)
+                if not found:
+                    walk_and_extract(rootf, '')
+                else:
+                    extracted = True
+            except Exception:
+                # Fallback to original walk if nested-aware extraction fails
+                walk_and_extract(rootf, '')
     except Exception as e:
         import traceback
         print(f"ERROR: Exception while extracting DDS files: {e}")
@@ -632,11 +775,34 @@ def _extract_matching_dds_to_temp(par_obj, names_set, gmd_internal_path: str = N
                     if 'rootf' in locals() and cache_root is rootf:
                         continue
                     scanned.append(cache_key)
-                    # walk the candidate root folder and try to extract matches into tmpdir
+
+                    # First try nested-aware extraction on this cache entry by
+                    # wrapping the cached root folder into a temporary object
+                    # that has a .folders attribute (the extractor expects a
+                    # Par-like object). If that doesn't find matches, fall
+                    # back to the simple folder walk.
                     try:
-                        walk_and_extract(cache_root, '')
+                        tmp_par_obj = type('TmpPar', (), {})()
+                        tmp_par_obj.folders = [cache_root]
+                        found = False
+                        try:
+                            found = _extract_dds_from_par_object(tmp_par_obj, tmpdir, names_set=names_set, gmd_internal_path=None, context=context)
+                        except Exception:
+                            found = False
+                        if not found:
+                            try:
+                                walk_and_extract(cache_root, '')
+                            except Exception:
+                                pass
+                        else:
+                            extracted = True
                     except Exception:
-                        pass
+                        # conservative fallback: try the folder walk if anything goes wrong
+                        try:
+                            walk_and_extract(cache_root, '')
+                        except Exception:
+                            pass
+
                     if extracted:
                         print(f"[yk_par_lib_tool] Found matching DDS files in another PAR cache entry: {cache_key}")
                         found_elsewhere = True
@@ -2197,8 +2363,8 @@ class YKPAR_OT_refresh(Operator):
                     for f in getattr(folder, 'files', []) or []:
                         name = f.name or ''
                         lname = name.lower()
-                        # Only include .gmd files
-                        if not lname.endswith('.gmd'):
+                        # Include .gmd, .par, and .gmt files so embedded PARs, GMDs, and GMTs are visible
+                        if not (lname.endswith('.gmd') or lname.endswith('.par') or lname.endswith('.gmt')):
                             continue
                         # If the folder matched, include all files under it; otherwise, match by filename
                         if filter_text and not folder_matches and filter_text not in lname:
@@ -2554,6 +2720,11 @@ class YKPAR_PT_browser(Panel):
         row.operator('yk_par_lib_tool.refresh_par_listing', text='Unpack Loaded PARs', icon='PACKAGE')
         row.operator('yk_par_lib_tool.clear_par_filter', text='', icon='X')
         row.operator('yk_par_lib_tool.relink_preserved_tmp', text='Relink Textures')
+        # Allow the user to register the bundled GMT importer at runtime if needed
+        try:
+            row.operator('yk_par_lib_tool.register_gmt_importer', text='Register GMT Importer', icon='IMPORT')
+        except Exception:
+            pass
         row.operator('yk_par_lib_tool.extract_textures_from_configured_par', text='Extract Textures from Configured PAR')
         row.operator('yk_par_lib_tool.confirm_import_selected', text='Import Selected')
         #row.operator('yk_par_lib_tool.import_visible_all', text='Import All')
@@ -2591,7 +2762,8 @@ class YKPAR_PT_browser(Panel):
                 try:
                     mid_col.label(text=item.name, icon='FILE')
                     # Put all per-file import actions into a single small column so icons are consistent
-                    # Create a small horizontal row for the three import buttons
+                    # Create a small horizontal row for the three import buttons. Ensure the row is
+                    # created before any operator calls so Blender draws real buttons (not deferred labels).
                     try:
                         act_row = right.row(align=True)
                         # Increase horizontal scale so the three import icons are wider and easier to click
@@ -2600,17 +2772,41 @@ class YKPAR_PT_browser(Panel):
                     except Exception:
                         act_row = right.row(align=True)
 
-                    imp = act_row.operator('yk_par_lib_tool.import_par_file', text='', icon='IMPORT')
-                    imp.par_path = item.par_path
-                    imp.internal_path = item.internal_path
+                    try:
+                        lname = (getattr(item, 'name', '') or '').lower()
+                        if lname.endswith('.par'):
+                            # Show only the labeled button for nested PAR files
+                            try:
+                                unpack_mid = act_row.operator('yk_par_lib_tool.unpack_and_link_par', text='', icon='IMAGE_DATA')
+                                unpack_mid.par_path = item.par_path
+                                unpack_mid.internal_path = item.internal_path
+                            except Exception:
+                                pass
+                        else:
+                            lname2 = (getattr(item, 'name', '') or '').lower()
+                            if lname2.endswith('.gmt'):
+                                # For GMT files, only show the GMT import button
+                                try:
+                                    gmt_op = act_row.operator('yk_par_lib_tool.import_gmt_from_par', text='', icon='ACTION')
+                                    gmt_op.par_path = item.par_path
+                                    gmt_op.internal_path = item.internal_path
+                                except Exception:
+                                    pass
+                            else:
+                                # For non-GMT files, show all import buttons
+                                imp = act_row.operator('yk_par_lib_tool.import_par_file', text='', icon='IMPORT')
+                                imp.par_path = item.par_path
+                                imp.internal_path = item.internal_path
 
-                    arm = act_row.operator('yk_par_lib_tool.import_par_armature', text='', icon='ARMATURE_DATA')
-                    arm.par_path = item.par_path
-                    arm.internal_path = item.internal_path
+                                arm = act_row.operator('yk_par_lib_tool.import_par_armature', text='', icon='ARMATURE_DATA')
+                                arm.par_path = item.par_path
+                                arm.internal_path = item.internal_path
 
-                    anim = act_row.operator('yk_par_lib_tool.import_par_animation', text='', icon='ACTION')
-                    anim.par_path = item.par_path
-                    anim.internal_path = item.internal_path
+                                anim = act_row.operator('yk_par_lib_tool.import_par_animation', text='', icon='ACTION')
+                                anim.par_path = item.par_path
+                                anim.internal_path = item.internal_path
+                    except Exception:
+                        mid_col.label(text=str(getattr(item, 'name', '<item>')))
                 except Exception:
                     mid_col.label(text=str(getattr(item, 'name', '<item>')))
 
@@ -2667,7 +2863,9 @@ class YKPAR_PT_browser(Panel):
                 if is_exp:
                     # list files at this level
                     for f in getattr(folder, 'files', []) or []:
-                        if not getattr(f, 'name', '').lower().endswith('.gmd'):
+                        # Include .gmd, .par, and .gmt files so embedded PARs, GMDs, and GMTs are visible
+                        lname = (getattr(f, 'name', '') or '').lower()
+                        if not (lname.endswith('.gmd') or lname.endswith('.par') or lname.endswith('.gmt')):
                             continue
                         rowf = box.row(align=True)
                         toggle_factor_f = min(0.25, 0.04 + depth * 0.04)
@@ -2680,6 +2878,8 @@ class YKPAR_PT_browser(Panel):
                         # spacer/toggle column leftf — leave empty for files
                         # Place the file label and icon in the mid column (no inner split)
                         midf_col.label(text=f.name, icon='FILE')
+                        # Ensure the action row is created before any operator calls so Blender shows
+                        # proper clickable operator buttons (not labels). Create the action row first.
                         try:
                             act_rowf = rightf.row(align=True)
                             # Match the wider scale in folder listing for consistency
@@ -2688,17 +2888,39 @@ class YKPAR_PT_browser(Panel):
                         except Exception:
                             act_rowf = rightf.row(align=True)
 
-                        imp = act_rowf.operator('yk_par_lib_tool.import_par_file', text='', icon='IMPORT')
-                        imp.par_path = par_path
-                        imp.internal_path = (prefix + f.name).lstrip('/')
+                        # If this file is a .par, provide a single Unpack & Link button
+                        try:
+                            if lname.endswith('.par'):
+                                try:
+                                    labeled = act_rowf.operator('yk_par_lib_tool.unpack_and_link_par', text='', icon='IMAGE_DATA')
+                                    labeled.par_path = par_path
+                                    labeled.internal_path = (prefix + f.name).lstrip('/')
+                                except Exception:
+                                    pass
+                            else:
+                                if lname.endswith('.gmt'):
+                                    # For GMT files, only show the GMT import button
+                                    try:
+                                        gmtf = act_rowf.operator('yk_par_lib_tool.import_gmt_from_par', text='', icon='ACTION')
+                                        gmtf.par_path = par_path
+                                        gmtf.internal_path = (prefix + f.name).lstrip('/')
+                                    except Exception:
+                                        pass
+                                else:
+                                    # For non-GMT files, show all import buttons
+                                    imp = act_rowf.operator('yk_par_lib_tool.import_par_file', text='', icon='IMPORT')
+                                    imp.par_path = par_path
+                                    imp.internal_path = (prefix + f.name).lstrip('/')
 
-                        armf = act_rowf.operator('yk_par_lib_tool.import_par_armature', text='', icon='ARMATURE_DATA')
-                        armf.par_path = par_path
-                        armf.internal_path = (prefix + f.name).lstrip('/')
+                                    armf = act_rowf.operator('yk_par_lib_tool.import_par_armature', text='', icon='ARMATURE_DATA')
+                                    armf.par_path = par_path
+                                    armf.internal_path = (prefix + f.name).lstrip('/')
 
-                        animf = act_rowf.operator('yk_par_lib_tool.import_par_animation', text='', icon='ACTION')
-                        animf.par_path = par_path
-                        animf.internal_path = (prefix + f.name).lstrip('/')
+                                    animf = act_rowf.operator('yk_par_lib_tool.import_par_animation', text='', icon='ACTION')
+                                    animf.par_path = par_path
+                                    animf.internal_path = (prefix + f.name).lstrip('/')
+                        except Exception:
+                            pass
                     # recurse into subfolders
                     for sub in getattr(folder, 'folders', []) or []:
                         draw_folder(box, par_path, sub, prefix + sub.name + '/', depth + 1)
@@ -2960,6 +3182,203 @@ class YKPAR_OT_extract_textures_from_par(Operator):
         return {'FINISHED'}
 
 
+class YKPAR_OT_unpack_and_link_par(Operator):
+    """Unpack a .par (or an embedded .par entry inside another PAR) and relink images in one operation."""
+    bl_idname = 'yk_par_lib_tool.unpack_and_link_par'
+    bl_label = 'Unpack and Link PAR'
+
+    par_path: StringProperty()
+    internal_path: StringProperty()
+
+    def execute(self, context):
+        # par_path may point to a filesystem .par (configured) OR be the parent PAR file
+        # in which case internal_path points to an embedded .par entry. Support both.
+        par_path = getattr(self, 'par_path', None)
+        internal = getattr(self, 'internal_path', '') or ''
+
+        if not par_path or not os.path.exists(par_path):
+            self.report({'ERROR'}, f'Invalid PAR path: {par_path}')
+            return {'CANCELLED'}
+
+        try:
+            top_par = read_par(par_path)
+        except Exception as e:
+            self.report({'ERROR'}, f'Failed to read PAR: {e}')
+            return {'CANCELLED'}
+
+        # If internal_path points to a .par file inside top_par, extract that embedded par bytes
+        if internal and internal.lower().endswith('.par'):
+            # find file object inside top_par
+            target = None
+
+            def _norm_path(p: str) -> str:
+                if not p:
+                    return ''
+                return p.lstrip('/').replace('\\', '/').lower()
+
+            internal_norm = _norm_path(internal)
+
+            def find_file(folder, prefix):
+                nonlocal target
+                for f in getattr(folder, 'files', []) or []:
+                    candidate = _norm_path(prefix + (f.name or ''))
+                    if candidate == internal_norm:
+                        target = f
+                        return True
+                for sub in getattr(folder, 'folders', []) or []:
+                    if find_file(sub, prefix + (sub.name or '') + '/'):
+                        return True
+                return False
+
+            root = top_par.folders[0] if getattr(top_par, 'folders', None) and len(top_par.folders) else None
+            if not root:
+                self.report({'ERROR'}, 'Parent PAR has no root')
+                return {'CANCELLED'}
+            find_file(root, '')
+            if not target:
+                self.report({'ERROR'}, f'Embedded PAR file not found inside {par_path}: {internal}')
+                return {'CANCELLED'}
+
+            # Decompress embedded PAR bytes if necessary
+            try:
+                data = decompress_file(target) if getattr(target, 'compression', 0) else target.data
+                if isinstance(data, (bytearray, memoryview)):
+                    data = bytes(data)
+            except Exception as e:
+                self.report({'ERROR'}, f'Failed to read embedded PAR bytes: {e}')
+                return {'CANCELLED'}
+
+            # write embedded PAR to a deterministic file in the configured extract path (or temp)
+            try:
+                pref_dir = ''
+                prefs_addon = context.preferences.addons.get('yk_par_lib_tool')
+                if prefs_addon and getattr(prefs_addon, 'preferences', None):
+                    pref_dir = getattr(prefs_addon.preferences, 'dds_extract_path', '') or ''
+                if pref_dir:
+                    out_dir = _deterministic_extraction_subdir(pref_dir, None, None, prefix='ykpar_embedded_pars_')
+                else:
+                    # no configured preference: abort per preference-first behavior
+                    self.report({'ERROR'}, 'DDS extract path not configured in preferences; cannot write embedded PAR')
+                    return {'CANCELLED'}
+                sig = hashlib.sha1(data).hexdigest()[:12]
+                out_path = os.path.join(out_dir, f'embedded_{sig}.par')
+                if not os.path.exists(out_path):
+                    with open(out_path, 'wb') as ef:
+                        ef.write(data)
+            except Exception as e:
+                self.report({'ERROR'}, f'Failed to write embedded PAR to disk: {e}')
+                return {'CANCELLED'}
+
+            # Read the written embedded PAR and proceed to extract textures from it
+            try:
+                nested = read_par(out_path)
+            except Exception as e:
+                self.report({'ERROR'}, f'Failed to read written embedded PAR: {e}')
+                return {'CANCELLED'}
+
+            # Use deterministic extraction subdir for this embedded PAR
+            try:
+                pref_dir = getattr(prefs_addon.preferences, 'dds_extract_path', '') or '' if prefs_addon else ''
+                if not pref_dir:
+                    self.report({'ERROR'}, 'DDS extract path not configured; aborting')
+                    return {'CANCELLED'}
+                tmpdir = _deterministic_extraction_subdir(pref_dir, None, None, prefix='ykpar_dds_embedded_')
+            except Exception:
+                self.report({'ERROR'}, 'Failed to prepare extraction folder')
+                return {'CANCELLED'}
+
+            # Extract all DDS from nested PAR (including nested embedded PARs)
+            try:
+                found = _extract_dds_from_par_object(nested, tmpdir, names_set=None, gmd_internal_path=None, context=context)
+                if not found:
+                    # fallback: full walk extraction
+                    rootn = nested.folders[0] if getattr(nested, 'folders', None) and len(nested.folders) else None
+                    if rootn:
+                        def walk_extract(folder, prefix):
+                            for f in getattr(folder, 'files', []) or []:
+                                if (getattr(f, 'name', '') or '').lower().endswith('.dds'):
+                                    try:
+                                        data = decompress_file(f) if getattr(f, 'compression', 0) else f.data
+                                        if isinstance(data, (bytearray, memoryview)):
+                                            data = bytes(data)
+                                        _safe_write_bytes(tmpdir, f.name, data)
+                                    except Exception:
+                                        pass
+                            for s in getattr(folder, 'folders', []) or []:
+                                walk_extract(s, prefix + (s.name or '') + '/')
+                        walk_extract(rootn, '')
+            except Exception as e:
+                self.report({'ERROR'}, f'Failed extracting DDS from embedded PAR: {e}')
+                return {'CANCELLED'}
+
+            # Attempt relink
+            try:
+                relinked = _relink_images_from_folder(tmpdir, overwrite_linked=True, case_sensitive=False)
+                self.report({'INFO'}, f'Extracted textures to {tmpdir}, relinked {relinked} images')
+            except Exception as e:
+                self.report({'WARNING'}, f'Extracted textures to {tmpdir} but relink failed: {e}')
+            try:
+                _register_preserved_tmp(tmpdir)
+            except Exception:
+                pass
+
+            return {'FINISHED'}
+
+        # else: internal is not an embedded par entry; treat par_path as the target to extract from
+        try:
+            # Use preference-first extraction and deterministic subdir
+            prefs_addon = context.preferences.addons.get('yk_par_lib_tool')
+            pref_dir = getattr(prefs_addon.preferences, 'dds_extract_path', '') or '' if prefs_addon else ''
+            if not pref_dir:
+                self.report({'ERROR'}, 'DDS extract path not configured in add-on preferences')
+                return {'CANCELLED'}
+            tmpdir = _deterministic_extraction_subdir(pref_dir, None, None, prefix='ykpar_dds_par_')
+        except Exception:
+            self.report({'ERROR'}, 'Failed to prepare extraction folder')
+            return {'CANCELLED'}
+
+        # Extract from top_par
+        extracted = False
+        try:
+            root = top_par.folders[0] if getattr(top_par, 'folders', None) and len(top_par.folders) else None
+            if root:
+                def walk_and_extract(folder, prefix):
+                    nonlocal extracted
+                    for f in getattr(folder, 'files', []) or []:
+                        if not (getattr(f, 'name', '') or '').lower().endswith('.dds'):
+                            continue
+                        try:
+                            data = decompress_file(f) if getattr(f, 'compression', 0) else f.data
+                            if isinstance(data, (bytearray, memoryview)):
+                                data = bytes(data)
+                            _safe_write_bytes(tmpdir, f.name, data)
+                            extracted = True
+                        except Exception:
+                            pass
+                    for sub in getattr(folder, 'folders', []) or []:
+                        walk_and_extract(sub, prefix + (sub.name or '') + '/')
+                walk_and_extract(root, '')
+        except Exception as e:
+            self.report({'ERROR'}, f'Failed during extraction: {e}')
+            return {'CANCELLED'}
+
+        if not extracted:
+            self.report({'WARNING'}, 'No DDS files found in PAR')
+            return {'CANCELLED'}
+
+        try:
+            relinked = _relink_images_from_folder(tmpdir, overwrite_linked=True, case_sensitive=False)
+            self.report({'INFO'}, f'Extracted textures to {tmpdir}, relinked {relinked} images')
+        except Exception as e:
+            self.report({'WARNING'}, f'Extracted textures to {tmpdir} but relink failed: {e}')
+        try:
+            _register_preserved_tmp(tmpdir)
+        except Exception:
+            pass
+
+        return {'FINISHED'}
+
+
 class YKPAR_OT_import_visible_all(BaseImportGMD, Operator):
     """Import all visible .gmd items currently listed in the scene node list."""
     bl_idname = 'yk_par_lib_tool.import_visible_all'
@@ -3055,6 +3474,159 @@ class YKPAR_OT_import_visible_all(BaseImportGMD, Operator):
             IMPORT_IN_PROGRESS = False
 
         self.report({'INFO'}, f'Imported {imported_count} of {len(to_import)} visible files')
+        return {'FINISHED'}
+
+
+class YKPAR_OT_ui_debug_test(Operator):
+    """Simple debug operator to confirm UI operator wiring"""
+    bl_idname = 'yk_par_lib_tool.ui_debug_test'
+    bl_label = 'UI Debug Test'
+
+    def execute(self, context):
+        try:
+            print('[yk_par_lib_tool] UI debug operator invoked')
+        except Exception:
+            pass
+        try:
+            self.report({'INFO'}, 'UI debug operator invoked')
+        except Exception:
+            pass
+        return {'FINISHED'}
+
+
+class YKPAR_OT_import_gmt_from_par(Operator):
+    """Extract a .gmt from a PAR (or embedded) and import it via the GMT importer"""
+    bl_idname = 'yk_par_lib_tool.import_gmt_from_par'
+    bl_label = 'Import GMT from PAR'
+
+    par_path: StringProperty()
+    internal_path: StringProperty()
+
+    def execute(self, context):
+        par_path = getattr(self, 'par_path', None)
+        internal = getattr(self, 'internal_path', '') or ''
+
+        if not par_path or not os.path.exists(par_path):
+            self.report({'ERROR'}, f'Invalid PAR path: {par_path}')
+            return {'CANCELLED'}
+
+        try:
+            par = read_par(par_path)
+        except Exception as e:
+            self.report({'ERROR'}, f'Failed to read PAR: {e}')
+            return {'CANCELLED'}
+
+        # find target file object
+        target = None
+
+        def _norm_path(p: str) -> str:
+            if not p:
+                return ''
+            return p.lstrip('/').replace('\\', '/').lower()
+
+        internal_norm = _norm_path(internal)
+
+        def find_file(folder, prefix):
+            nonlocal target
+            for f in getattr(folder, 'files', []) or []:
+                candidate = _norm_path(prefix + (f.name or ''))
+                if candidate == internal_norm:
+                    target = f
+                    return True
+            for sub in getattr(folder, 'folders', []) or []:
+                if find_file(sub, prefix + (sub.name or '') + '/'):
+                    return True
+            return False
+
+        root = par.folders[0] if getattr(par, 'folders', None) and len(par.folders) else None
+        if not root:
+            self.report({'ERROR'}, 'PAR has no root')
+            return {'CANCELLED'}
+        find_file(root, '')
+        if not target:
+            self.report({'ERROR'}, f'GMT file not found inside PAR: {internal}')
+            return {'CANCELLED'}
+
+        # get raw bytes
+        try:
+            data = decompress_file(target) if getattr(target, 'compression', 0) else target.data
+            if isinstance(data, (bytearray, memoryview)):
+                data = bytes(data)
+        except Exception as e:
+            self.report({'ERROR'}, f'Failed to read GMT bytes: {e}')
+            return {'CANCELLED'}
+
+        # Write to configured extract dir (preference-first). If no pref, abort.
+        try:
+            prefs_addon = context.preferences.addons.get('yk_par_lib_tool')
+            pref_dir = getattr(prefs_addon.preferences, 'dds_extract_path', '') or '' if prefs_addon else ''
+            if not pref_dir:
+                self.report({'ERROR'}, 'DDS extract path not configured; set it in add-on preferences')
+                return {'CANCELLED'}
+            out_dir = _deterministic_extraction_subdir(pref_dir, None, None, prefix='ykpar_gmt_')
+            sig = hashlib.sha1(data).hexdigest()[:12]
+            out_fn = f'gmt_{sig}.gmt'
+            out_path = os.path.join(out_dir, out_fn)
+            if not os.path.exists(out_path):
+                with open(out_path, 'wb') as wf:
+                    wf.write(data)
+        except Exception as e:
+            self.report({'ERROR'}, f'Failed to write GMT to disk: {e}')
+            return {'CANCELLED'}
+
+        # Ensure an armature is active (the GMT importer expects an armature to attach actions to).
+        try:
+            ao = context.active_object
+            if not (ao and getattr(ao, 'type', '') == 'ARMATURE' and getattr(ao.data, 'bones', None)):
+                # Try to find any armature in the file and make it active
+                found = None
+                for ob in bpy.data.objects:
+                    try:
+                        if getattr(ob, 'type', '') == 'ARMATURE' and getattr(ob.data, 'bones', None):
+                            found = ob
+                            break
+                    except Exception:
+                        continue
+                if found:
+                    try:
+                        context.view_layer.objects.active = found
+                        ao = found
+                    except Exception:
+                        pass
+            if not ao or getattr(ao, 'type', '') != 'ARMATURE':
+                # No armature available; the importer may still work for camera/face-target imports,
+                # but warn the user so they can select an appropriate armature.
+                self.report({'WARNING'}, 'No armature active. Select a target armature before importing if needed.')
+
+            # Try to invoke the GMT import operator with the standard Blender file dialog
+            # This gives the user full control via the operator UI (with all import options)
+            try:
+                # First, try to call the operator directly
+                # INVOKE_DEFAULT will open the file picker popup
+                bpy.ops.import_scene.gmt('INVOKE_DEFAULT', filepath=out_path)
+                self.report({'INFO'}, f'Opened GMT import dialog for: {os.path.basename(out_path)}')
+                return {'FINISHED'}
+            except AttributeError:
+                # Operator not registered - offer to register it
+                self.report({'ERROR'}, 
+                    'GMT import operator not registered. Click "Register GMT Importer" button in the PAR Browser panel, then try again.')
+                return {'CANCELLED'}
+            except Exception as e:
+                # Some other error - log it
+                import traceback
+                print(f"[yk_par_lib_tool] GMT operator invoke failed: {e}")
+                traceback.print_exc()
+                self.report({'ERROR'}, f'Failed to invoke GMT import: {e}')
+                return {'CANCELLED'}
+        except Exception as e:
+            self.report({'ERROR'}, f'Failed preparing importer context: {e}')
+            return {'CANCELLED'}
+
+        try:
+            _register_preserved_tmp(out_dir)
+        except Exception:
+            pass
+
         return {'FINISHED'}
 
 
@@ -3267,15 +3839,149 @@ class YKPAR_OT_import_par_animation(Operator):
                     creator = GMDAnimationSceneCreator(target.name, gmd_scene, gmd_config, error)
                     creator.validate_scene()
                     coll = creator.make_collection(context)
-                    creator.make_bone_hierarchy(context, coll)
-                    creator.make_objects(context, coll, None, None)
+
+                    # Create armature and mapping, then build objects using that armature so
+                    # parenting and armature modifiers are set up correctly.
+                    try:
+                        armature_obj, node_map = creator.make_bone_hierarchy(context, coll)
+                    except Exception:
+                        armature_obj = None
+                        node_map = None
+
+                    # Build objects and ensure they receive the armature modifier & parenting
+                    creator.make_objects(context, coll, armature_obj, node_map)
+
+                    # After import, attempt to extract matching DDS files from the PAR and relink
+                    try:
+                        # Collect texture basenames referenced by the imported collection
+                        names_set = set()
+                        if coll:
+                            for obj in getattr(coll, 'objects', []) or []:
+                                for slot in getattr(obj, 'material_slots', []) or []:
+                                    ma = getattr(slot, 'material', None)
+                                    if not ma or not hasattr(ma, 'node_tree') or not ma.node_tree:
+                                        continue
+                                    for node in ma.node_tree.nodes:
+                                        if node.type == 'TEX_IMAGE' and node.image:
+                                            tex_name = os.path.splitext(node.image.name)[0].lower()
+                                            names_set.add(tex_name)
+
+                        tmp_dir = None
+                        if names_set:
+                            try:
+                                tmp_dir = _extract_matching_dds_to_temp(par, names_set, internal, context=context)
+                            except Exception:
+                                tmp_dir = None
+
+                        if tmp_dir:
+                            try:
+                                relinked = _relink_images_from_folder(tmp_dir, overwrite_linked=True, case_sensitive=False)
+                            except Exception:
+                                relinked = 0
+
+                            try:
+                                self.report({'INFO'}, f"Extracted textures and relinked {relinked} images")
+                            except Exception:
+                                pass
+
+                        # Attempt to write the original .gmd into the extraction folder for modding
+                        try:
+                            if tmp_dir:
+                                written = _write_gmd_to_extraction(file_bytes, target.name, tmp_dir, internal, names_set, context=context)
+                                if written:
+                                    try:
+                                        print(f"[yk_par_lib_tool] Wrote GMD to extraction folder: {written}")
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+
                     self.report({'INFO'}, f'Imported animation-style GMD: {target.name}')
                     return {'FINISHED'}
                 except Exception as e:
-                    self.report({'ERROR'}, f'Animation import failed: {e}')
+                    # Surface full traceback to the system console for debugging
+                    import traceback
+                    try:
+                        tb = traceback.format_exc()
+                        print(f"[yk_par_lib_tool] Animation import failed: {e}\n{tb}")
+                    except Exception:
+                        try:
+                            print(f"[yk_par_lib_tool] Animation import failed: {e}")
+                        except Exception:
+                            pass
+                    try:
+                        # Provide a user-facing error as well
+                        self.report({'ERROR'}, f'Animation import failed: {e}')
+                    except Exception:
+                        pass
                     return {'CANCELLED'}
             except Exception as e:
                 self.report({'ERROR'}, f'Import failed: {e}')
                 return {'CANCELLED'}
         finally:
             IMPORT_IN_PROGRESS = False
+
+
+class YKPAR_OT_register_gmt_importer(Operator):
+    """Register the bundled yakuza-gmt-blender importer during runtime."""
+    bl_idname = 'yk_par_lib_tool.register_gmt_importer'
+    bl_label = 'Register GMT Importer'
+
+    def execute(self, context):
+        try:
+            import sys
+            import os
+            
+            # Get the yakuza-gmt-blender package path
+            pkg_folder = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'yakuza-gmt-blender'))
+            
+            # Add to sys.path if not already there
+            if pkg_folder not in sys.path:
+                sys.path.insert(0, pkg_folder)
+            
+            # Import the top-level __init__.py which has the register() function
+            import importlib
+            
+            # If already imported, reload it
+            if 'yakuza_gmt_blender' in sys.modules:
+                yakuza_gmt = sys.modules['yakuza_gmt_blender']
+                importlib.reload(yakuza_gmt)
+            else:
+                # First time import - need to set up the module name properly
+                parent_folder = os.path.dirname(pkg_folder)
+                if parent_folder not in sys.path:
+                    sys.path.insert(0, parent_folder)
+                
+                # Try importing as a package
+                try:
+                    import importlib.util
+                    spec = importlib.util.spec_from_file_location(
+                        'yakuza_gmt_blender',
+                        os.path.join(pkg_folder, '__init__.py'),
+                        submodule_search_locations=[pkg_folder]
+                    )
+                    yakuza_gmt = importlib.util.module_from_spec(spec)
+                    sys.modules['yakuza_gmt_blender'] = yakuza_gmt
+                    spec.loader.exec_module(yakuza_gmt)
+                except Exception as e:
+                    print(f"[yk_par_lib_tool] Failed to import yakuza_gmt_blender package: {e}")
+                    raise
+            
+            # Now register the add-on
+            if hasattr(yakuza_gmt, 'register'):
+                yakuza_gmt.register()
+                print("[yk_par_lib_tool] Successfully registered bundled GMT importer")
+                self.report({'INFO'}, 'Registered bundled GMT importer - import_scene.gmt operator is now available')
+                return {'FINISHED'}
+            else:
+                self.report({'ERROR'}, 'GMT module has no register function')
+                return {'CANCELLED'}
+                
+        except Exception as e:
+            import traceback
+            print(f"[yk_par_lib_tool] ERROR registering GMT importer: {e}")
+            traceback.print_exc()
+            self.report({'ERROR'}, f'Failed to register GMT importer: {e}')
+        return {'CANCELLED'}
