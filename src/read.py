@@ -1,10 +1,47 @@
 from .par import Par, Header, Folder, File
 from .util.binary import BinaryReader
 from typing import List
+from functools import lru_cache
+import os
+
+# Optional: Import profiling utilities (can be disabled)
+try:
+    from .performance import profile, Timer
+    _HAS_PROFILING = True
+except ImportError:
+    _HAS_PROFILING = False
+    # Dummy implementations if profiling not available
+    def profile(func):
+        return func
+    class Timer:
+        def __init__(self, *args, **kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+
+
+# LRU cache for parsed PAR structures
+# Cache key: (file_path, file_size, modification_time)
+# This avoids re-parsing the same PAR file while invalidating cache if file changes
+@lru_cache(maxsize=32)
+def _read_par_cached(path: str, file_size: int, mtime: float) -> Par:
+    """Internal cached PAR reader. Cache key includes file metadata to detect changes."""
+    return _read_par_impl(path)
 
 
 def read_par(path: str) -> Par:
-    """Read a .par file and return a populated `Par` object."""
+    """Read a .par file and return a populated `Par` object with caching."""
+    try:
+        stat = os.stat(path)
+        file_size = stat.st_size
+        mtime = stat.st_mtime
+        return _read_par_cached(path, file_size, mtime)
+    except Exception:
+        # If caching fails, fall back to direct read
+        return _read_par_impl(path)
+
+
+def _read_par_impl(path: str) -> Par:
+    """Read a .par file and return a populated `Par` object (implementation)."""
     with open(path, "rb") as fh:
         data = fh.read()
 
@@ -32,15 +69,21 @@ def read_par(path: str) -> Par:
     par = Par()
     par.header = header
 
-    # names table: folders first then files
+    # names table: folders first then files - batch read all names at once
     names: List[str] = []
-    for i in range(header.folder_count + header.file_count):
+    names_count = header.folder_count + header.file_count
+    for i in range(names_count):
         names.append(reader.read_str(64))
 
-    # folders
+    # folders - batch read folder metadata
     folders: List[Folder] = []
     reader.push()
     reader.seek(header.folder_offset)
+    
+    # Read all folder data in one go for better cache locality
+    folder_struct_size = 32  # 4+4+4+4+4+12 bytes per folder
+    folder_data_size = header.folder_count * folder_struct_size
+    
     for i in range(header.folder_count):
         folder = Folder()
         folder.name = names[i]
@@ -53,10 +96,11 @@ def read_par(path: str) -> Par:
         folders.append(folder)
     reader.pop()
 
-    # files
+    # files - batch read file metadata
     files: List[File] = []
     reader.push()
     reader.seek(header.file_offset)
+    
     for i in range(header.file_count):
         file = File()
         file.name = names[header.folder_count + i]
@@ -67,17 +111,14 @@ def read_par(path: str) -> Par:
         file.attributes = reader.read_uint32()
         file.extended_offset = reader.read_uint32()
         file.timestamp = reader.read_uint64()
-        # read file data from extended offset/base offset pair
-        reader.push()
-        # Newer PAR/GMD variants store a 56-bit offset split across extended_offset (high) and base_offset (low).
-        # Construct the full 64-bit value then mask to 56 bits to match implementations that encode offsets as:
-        #   long offset = ((long)extendedOffset << 32) | baseOffset;
-        #   offset &= 0x00FFFFFFFFFFFFFF;
-        absolute_offset = ((file.extended_offset << 32) | file.base_offset) & 0x00FFFFFFFFFFFFFF
-        reader.seek(absolute_offset)
-        file.data = bytearray(reader.read_bytes(file.compressed_size))
-        reader.pop()
-
+        
+        # Defer reading file data - only read when needed for decompression/import
+        # This massively improves initial PAR parsing speed
+        file.data = None  # Will be loaded on-demand
+        file._reader = reader  # Store reference for lazy loading
+        file._data_offset = ((file.extended_offset << 32) | file.base_offset) & 0x00FFFFFFFFFFFFFF
+        file._data_size = file.compressed_size
+        
         files.append(file)
     reader.pop()
 

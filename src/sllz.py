@@ -115,6 +115,11 @@ def decompress_sllz(buf: bytearray) -> bytearray:
 
 
 def decompress_file(file: File) -> bytearray:
+    """Decompress a file from a PAR archive, loading data lazily if needed."""
+    # Ensure file data is loaded before decompression
+    if hasattr(file, '_ensure_data_loaded'):
+        file._ensure_data_loaded()
+    
     if file.compression:
         out = decompress_sllz(file.data)
         if DEBUG_SLLZ:
@@ -129,7 +134,12 @@ def decompress_file(file: File) -> bytearray:
 
 
 def decompress_par(par: Par) -> None:
+    """Decompress all files in a PAR archive (in-place)."""
     for file in par.files:
+        # Ensure data is loaded before attempting decompression
+        if hasattr(file, '_ensure_data_loaded'):
+            file._ensure_data_loaded()
+        
         if file.compression:
             file.data = decompress_sllz(file.data)
             file.compression = 0

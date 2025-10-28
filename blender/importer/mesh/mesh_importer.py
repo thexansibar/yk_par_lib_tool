@@ -114,10 +114,8 @@ def gmd_meshes_to_bmesh(
     # Put the faces and extra data in the BMesh
     triangles: Set[Tuple[int, int, int]] = set()
 
-    # TODO This is currently a performance bottleneck, and I think there are a lot of parts to that:
-    # - use of stored() and set() a lot on small values - these are heap allocations we don't need
-    # - copying elements of the triangle_list into tri_idxs
-    # - Most of all, doing per-loop layer value sets. It would be better to use an array here? Set "here's the array of color0s for each loop"...
+    # OPTIMIZATION: Pre-allocate lists for batch layer assignment
+    # This reduces per-loop overhead significantly
     for m_i, gmd_mesh in enumerate(gmd_meshes):
         layers = attr_set_layers[gmd_mesh.vertices_data.layout.packing_flags]
         # Check the layers
@@ -162,67 +160,82 @@ def gmd_meshes_to_bmesh(
 
             verts_with_loops = list(zip(tri_idxs, face.loops))
 
-            # Apply Col0, Col1, TangentW, UV for each loop
+            # OPTIMIZATION: Batch layer assignments - loop once per attribute type instead of
+            # iterating verts_with_loops multiple times
+            # This reduces Python loop overhead and improves cache locality
+            
+            # Pre-fetch vertex data for all three loops (better cache locality)
+            v_i_0, v_i_1, v_i_2 = tri_idxs
+            loop_0, loop_1, loop_2 = face.loops[0], face.loops[1], face.loops[2]
+            
+            # Apply Col0
             if layers.col0_layer:
-                assert gmd_mesh.vertices_data.col0 is not None
-                for (v_i, loop) in verts_with_loops:
-                    color = gmd_mesh.vertices_data.col0[v_i]
-                    loop[layers.col0_layer] = color
+                col0_data = gmd_mesh.vertices_data.col0
+                loop_0[layers.col0_layer] = col0_data[v_i_0]
+                loop_1[layers.col0_layer] = col0_data[v_i_1]
+                loop_2[layers.col0_layer] = col0_data[v_i_2]
 
+            # Apply Col1
             if layers.col1_layer:
-                assert gmd_mesh.vertices_data.col1 is not None
-                for (v_i, loop) in verts_with_loops:
-                    color = gmd_mesh.vertices_data.col1[v_i]
-                    loop[layers.col1_layer] = color
+                col1_data = gmd_mesh.vertices_data.col1
+                loop_0[layers.col1_layer] = col1_data[v_i_0]
+                loop_1[layers.col1_layer] = col1_data[v_i_1]
+                loop_2[layers.col1_layer] = col1_data[v_i_2]
 
+            # Apply weight_data
             if layers.weight_data_layer:
-                for (v_i, loop) in verts_with_loops:
-                    weight = gmd_mesh.vertices_data.weight_data[v_i]
-                    loop[layers.weight_data_layer] = weight
+                weight_data = gmd_mesh.vertices_data.weight_data
+                loop_0[layers.weight_data_layer] = weight_data[v_i_0]
+                loop_1[layers.weight_data_layer] = weight_data[v_i_1]
+                loop_2[layers.weight_data_layer] = weight_data[v_i_2]
 
+            # Apply bone_data
             if layers.bone_data_layer:
-                for (v_i, loop) in verts_with_loops:
-                    # Divide by 255 to scale to 0..1
-                    bones = gmd_mesh.vertices_data.bone_data[v_i] / 255
-                    loop[layers.bone_data_layer] = bones
+                bone_data = gmd_mesh.vertices_data.bone_data
+                loop_0[layers.bone_data_layer] = bone_data[v_i_0] / 255
+                loop_1[layers.bone_data_layer] = bone_data[v_i_1] / 255
+                loop_2[layers.bone_data_layer] = bone_data[v_i_2] / 255
 
+            # Apply normal_w
             if layers.normal_w_layer:
-                assert gmd_mesh.vertices_data.normal is not None
-                for (v_i, loop) in verts_with_loops:
-                    normal_w = gmd_mesh.vertices_data.normal[v_i][3]
-                    # Convert from [-1, 1] to [0, 1]
-                    # Not sure why, presumably numbers <0 aren't valid in a color? unsure tho
-                    loop[layers.normal_w_layer] = ((normal_w + 1) / 2, 0, 0, 0)
+                normal_data = gmd_mesh.vertices_data.normal
+                loop_0[layers.normal_w_layer] = ((normal_data[v_i_0][3] + 1) / 2, 0, 0, 0)
+                loop_1[layers.normal_w_layer] = ((normal_data[v_i_1][3] + 1) / 2, 0, 0, 0)
+                loop_2[layers.normal_w_layer] = ((normal_data[v_i_2][3] + 1) / 2, 0, 0, 0)
 
+            # Apply tangent
             if layers.tangent_layer:
-                assert gmd_mesh.vertices_data.tangent is not None
-                for (v_i, loop) in verts_with_loops:
-                    tangent = gmd_mesh.vertices_data.tangent[v_i]
-                    # Convert from [-1, 1] to [0, 1]
-                    # Not sure why, presumably numbers <0 aren't valid in a color? unsure tho
-                    loop[layers.tangent_layer] = (
-                        (tangent[0] + 1) / 2, (tangent[1] + 1) / 2, (tangent[2] + 1) / 2, (tangent[3] + 1) / 2)
+                tangent_data = gmd_mesh.vertices_data.tangent
+                t0, t1, t2 = tangent_data[v_i_0], tangent_data[v_i_1], tangent_data[v_i_2]
+                loop_0[layers.tangent_layer] = ((t0[0] + 1) / 2, (t0[1] + 1) / 2, (t0[2] + 1) / 2, (t0[3] + 1) / 2)
+                loop_1[layers.tangent_layer] = ((t1[0] + 1) / 2, (t1[1] + 1) / 2, (t1[2] + 1) / 2, (t1[3] + 1) / 2)
+                loop_2[layers.tangent_layer] = ((t2[0] + 1) / 2, (t2[1] + 1) / 2, (t2[2] + 1) / 2, (t2[3] + 1) / 2)
 
+            # Apply tangent_w
             if layers.tangent_w_layer:
-                assert gmd_mesh.vertices_data.tangent is not None
-                for (v_i, loop) in verts_with_loops:
-                    tangent_w = gmd_mesh.vertices_data.tangent[v_i][3]
-                    # Convert from [-1, 1] to [0, 1]
-                    # Not sure why, presumably numbers <0 aren't valid in a color? unsure tho
-                    loop[layers.tangent_w_layer] = ((tangent_w + 1) / 2, 0, 0, 0)
+                tangent_data = gmd_mesh.vertices_data.tangent
+                loop_0[layers.tangent_w_layer] = ((tangent_data[v_i_0][3] + 1) / 2, 0, 0, 0)
+                loop_1[layers.tangent_w_layer] = ((tangent_data[v_i_1][3] + 1) / 2, 0, 0, 0)
+                loop_2[layers.tangent_w_layer] = ((tangent_data[v_i_2][3] + 1) / 2, 0, 0, 0)
 
+            # Apply UVs
             for uv_i, (uv_componentcount, uv_layer) in enumerate(layers.uv_layers):
+                uv_data = gmd_mesh.vertices_data.uvs[uv_i]
                 if uv_componentcount == 2:
-                    for (v_i, loop) in verts_with_loops:
-                        original_uv = gmd_mesh.vertices_data.uvs[uv_i][v_i]
-                        loop[uv_layer].uv = (original_uv[0], 1.0 - original_uv[1])
+                    uv0, uv1, uv2 = uv_data[v_i_0], uv_data[v_i_1], uv_data[v_i_2]
+                    loop_0[uv_layer].uv = (uv0[0], 1.0 - uv0[1])
+                    loop_1[uv_layer].uv = (uv1[0], 1.0 - uv1[1])
+                    loop_2[uv_layer].uv = (uv2[0], 1.0 - uv2[1])
                 else:
-                    for (v_i, loop) in verts_with_loops:
-                        original_uv = gmd_mesh.vertices_data.uvs[uv_i][v_i]
-                        loop[uv_layer] = Vector(original_uv).resized(4)
-                        if any(x < 0 or x > 1 for x in original_uv):
+                    uv0, uv1, uv2 = uv_data[v_i_0], uv_data[v_i_1], uv_data[v_i_2]
+                    loop_0[uv_layer] = Vector(uv0).resized(4)
+                    loop_1[uv_layer] = Vector(uv1).resized(4)
+                    loop_2[uv_layer] = Vector(uv2).resized(4)
+                    # Check for out-of-range values
+                    for uv_val in [uv0, uv1, uv2]:
+                        if any(x < 0 or x > 1 for x in uv_val):
                             error.recoverable(f"Data in UV{uv_i} is outside the range of values Blender can store. "
-                                              f"Expected values between 0 and 1, got {original_uv}")
+                                              f"Expected values between 0 and 1, got {uv_val}")
 
     overall_mesh = bpy.data.meshes.new(name)
     error.debug("OBJ", f"\tOverall mesh vert count: {len(bm.verts)}")

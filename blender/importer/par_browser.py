@@ -18,6 +18,30 @@ from .scene_creators.unskinned import GMDUnskinnedSceneCreator
 from .scene_creators.animation import GMDAnimationSceneCreator
 
 
+def _get_file_data(file_obj):
+    """
+    Safely get file data, handling both compressed and uncompressed files with lazy loading.
+    
+    IMPORTANT: This function ensures lazy-loaded data is properly loaded before access.
+    Always use this instead of directly accessing file.data or file_obj.data to avoid 
+    writing 0-byte files!
+    
+    Args:
+        file_obj: A File object from PAR structure
+    
+    Returns:
+        bytes: The file data (decompressed if needed)
+    """
+    if getattr(file_obj, 'compression', 0):
+        # Compressed file - decompress_file handles lazy loading internally
+        return decompress_file(file_obj)
+    else:
+        # Uncompressed file - ensure lazy loading is triggered
+        if hasattr(file_obj, '_ensure_data_loaded'):
+            file_obj._ensure_data_loaded()
+        return file_obj.data
+
+
 class YKPAR_NodeItem(PropertyGroup):
     name: StringProperty()
     internal_path: StringProperty()  # path inside the PAR (folders separated by /)
@@ -77,6 +101,78 @@ IMPORT_IN_PROGRESS = False
 # Preserved temp directories created during extraction (kept for inspection)
 PRESERVED_TMP_DIRS = []
 _PRESERVED_REGISTRY_PATH = os.path.join(tempfile.gettempdir(), 'ykpar_preserved_dirs.json')
+
+# Search index for fast filtering - maps PAR path to file index
+# Structure: {par_path: {'files': [(name_lower, internal_path, name, depth, is_folder), ...], 'folders': set()}}
+_SEARCH_INDEX = {}
+
+def _build_search_index(par_path: str, par) -> None:
+    """Build an optimized search index for a PAR file.
+    
+    This pre-processes the PAR structure to enable fast substring filtering
+    without walking the entire folder tree on every keystroke.
+    """
+    files_list = []
+    folders_set = set()
+    
+    def index_folder(folder, prefix, depth):
+        if not folder:
+            return
+        
+        folder_name_lower = (folder.name or '').lower()
+        folders_set.add(folder_name_lower)
+        
+        # Index files at this level
+        for f in getattr(folder, 'files', []) or []:
+            name = f.name or ''
+            lname = name.lower()
+            # Only index relevant file types
+            if lname.endswith('.gmd') or lname.endswith('.par') or lname.endswith('.gmt'):
+                internal_path = (prefix + name).lstrip('/')
+                files_list.append((lname, internal_path, name, depth, False, prefix))
+        
+        # Recurse into subfolders
+        for sub in getattr(folder, 'folders', []) or []:
+            subname = sub.name or ''
+            internal_path = (prefix + subname + '/').lstrip('/')
+            files_list.append((subname.lower(), internal_path, subname, depth, True, prefix))
+            index_folder(sub, prefix + subname + '/', depth + 1)
+    
+    root = par.folders[0] if getattr(par, 'folders', None) and len(par.folders) else None
+    if root:
+        index_folder(root, '', 1)
+    
+    _SEARCH_INDEX[par_path] = {
+        'files': files_list,
+        'folders': folders_set
+    }
+
+
+def _query_search_index(par_path: str, filter_text: str) -> list:
+    """Query the search index with a filter string.
+    
+    Returns list of (name, internal_path, is_folder, depth) tuples matching the filter.
+    This is much faster than walking the folder tree for every filter change.
+    """
+    if par_path not in _SEARCH_INDEX:
+        return []
+    
+    index = _SEARCH_INDEX[par_path]
+    results = []
+    filter_lower = filter_text.lower().strip()
+    
+    if not filter_lower:
+        # No filter - return all indexed files
+        for lname, internal_path, name, depth, is_folder, prefix in index['files']:
+            results.append((name, internal_path, is_folder, depth))
+        return results
+    
+    # Filter by substring match
+    for lname, internal_path, name, depth, is_folder, prefix in index['files']:
+        if filter_lower in lname or filter_lower in prefix.lower():
+            results.append((name, internal_path, is_folder, depth))
+    
+    return results
 
 
 def _register_preserved_tmp(tmpdir: str) -> None:
@@ -428,7 +524,14 @@ def _extract_dds_hires_to_temp(par_obj, gmd_internal_path: str = None, context=N
 
             if should_extract:
                 try:
-                    data = decompress_file(f) if getattr(f, 'compression', 0) else f.data
+                    # BUGFIX: Ensure data is loaded before accessing f.data (lazy loading)
+                    if getattr(f, 'compression', 0):
+                        data = decompress_file(f)
+                    else:
+                        # Trigger lazy loading if needed
+                        if hasattr(f, '_ensure_data_loaded'):
+                            f._ensure_data_loaded()
+                        data = f.data
                     if isinstance(data, (bytearray, memoryview)):
                         data = bytes(data)
                     try:
@@ -507,7 +610,7 @@ def _extract_dds_from_par_object(par_obj, tmpdir, names_set=None, gmd_internal_p
                     # Not a DDS: check if it's a nested PAR (by extension or magic)
                     try:
                         # Get raw bytes (decompress if needed)
-                        data = decompress_file(f) if getattr(f, 'compression', 0) else f.data
+                        data = _get_file_data(f)
                         if isinstance(data, (bytearray, memoryview)):
                             data = bytes(data)
                         # Detect embedded PAR by name or magic
@@ -575,7 +678,14 @@ def _extract_dds_from_par_object(par_obj, tmpdir, names_set=None, gmd_internal_p
 
                 # decompress if needed and write
                 try:
-                    data = decompress_file(f) if getattr(f, 'compression', 0) else f.data
+                    # BUGFIX: Ensure data is loaded before accessing f.data (lazy loading)
+                    if getattr(f, 'compression', 0):
+                        data = decompress_file(f)
+                    else:
+                        # Trigger lazy loading if needed
+                        if hasattr(f, '_ensure_data_loaded'):
+                            f._ensure_data_loaded()
+                        data = f.data
                     if isinstance(data, (bytearray, memoryview)):
                         data = bytes(data)
                     target_candidate = os.path.join(tmpdir, f.name)
@@ -697,7 +807,7 @@ def _extract_matching_dds_to_temp(par_obj, names_set, gmd_internal_path: str = N
             if matched:
                 try:
                     print(f"[yk_par_lib_tool] Candidate DDS match: {internal} -> base='{base}' (in names_set)")
-                    data = decompress_file(f) if getattr(f, 'compression', 0) else f.data
+                    data = _get_file_data(f)
                     if isinstance(data, (bytearray, memoryview)):
                         data = bytes(data)
                     # Diagnostic: report decompressed DDS file size
@@ -1170,7 +1280,7 @@ class YKPAR_OT_import_file(Operator):
                     self.report({'ERROR'}, f"Failed to decompress file: {de}")
                     return {'CANCELLED'}
             else:
-                target_data = target.data
+                target_data = _get_file_data(target)
 
             file_bytes = bytes(target_data) if isinstance(target_data, (bytearray, memoryview)) else target_data
             from .gmd_importers import import_gmd_bytes_to_collection
@@ -1339,7 +1449,7 @@ class YKPAR_OT_import_file(Operator):
                         self.report({'ERROR'}, f"Failed to decompress file: {de}")
                         return {'CANCELLED'}
                 else:
-                    target_data = target.data
+                    target_data = _get_file_data(target)
                 
                 file_bytes = bytes(target_data) if isinstance(target_data, (bytearray, memoryview)) else target_data
                 from .gmd_importers import import_gmd_bytes_to_collection
@@ -1398,7 +1508,7 @@ class YKPAR_OT_import_file(Operator):
                                 if fname.endswith('.dds') and base in names_set:
                                     try:
                                         # handle compressed files
-                                        raw = decompress_file(f) if getattr(f, 'compression', 0) else f.data
+                                        raw = _get_file_data(f)
                                         data = bytes(raw) if isinstance(raw, (bytearray, memoryview)) else raw
                                         out_path = _safe_write_bytes(tmp_dir, os.path.basename(fname), data)
                                         extracted_files.append(out_path)
@@ -1629,7 +1739,7 @@ class YKPAR_OT_import_file(Operator):
                         self.report({'ERROR'}, f"Failed to decompress file: {de}")
                         return {'CANCELLED'}
                 else:
-                    target_data = target.data
+                    target_data = _get_file_data(target)
 
                 file_bytes = bytes(target_data) if isinstance(target_data, (bytearray, memoryview)) else target_data
                 from .gmd_importers import import_gmd_bytes_to_collection
@@ -1680,7 +1790,7 @@ class YKPAR_OT_import_file(Operator):
                                 if fname.endswith('.dds') and base in names_set:
                                     try:
                                         # handle compressed files
-                                        raw = decompress_file(f) if getattr(f, 'compression', 0) else f.data
+                                        raw = _get_file_data(f)
                                         data = bytes(raw) if isinstance(raw, (bytearray, memoryview)) else raw
                                         out_path = _safe_write_bytes(tmp_dir, os.path.basename(fname), data)
                                         extracted_files.append(out_path)
@@ -1933,7 +2043,7 @@ class YKPAR_OT_import_selected_multiple(BaseImportGMD, Operator):
                                 self.report({'WARNING'}, f'Failed to decompress file: {de}')
                                 continue
                         else:
-                            target_data = target.data
+                            target_data = _get_file_data(target)
                         
                         file_bytes = bytes(target_data) if isinstance(target_data, (bytearray, memoryview)) else target_data
                         try:
@@ -2064,7 +2174,7 @@ class YKPAR_OT_place_file(Operator):
                         self.report({'ERROR'}, f"Failed to decompress file: {de}")
                         return {'CANCELLED'}
                 else:
-                    target_data = target.data
+                    target_data = _get_file_data(target)
 
                 file_bytes = bytes(target_data) if isinstance(target_data, (bytearray, memoryview)) else target_data
                 from .gmd_importers import import_gmd_bytes_to_collection
@@ -2308,6 +2418,9 @@ class YKPAR_OT_refresh(Operator):
     bl_description = "Unpack configured PAR files and refresh the browser so their contents are available. Use the Filter field to narrow results."
 
     def execute(self, context):
+        # Ensure scene properties are registered before accessing them
+        _ensure_scene_properties()
+        
         scene = context.scene
         scene.yk_par_nodes.clear()
 
@@ -2319,6 +2432,7 @@ class YKPAR_OT_refresh(Operator):
             self.report({'ERROR'}, "yk_par_lib_tool preferences not found")
             return {'CANCELLED'}
         prefs = prefs.preferences
+        
         for entry in getattr(prefs, 'par_files', []):
             par_path = entry.path
             if not par_path or not os.path.exists(par_path):
@@ -2336,78 +2450,99 @@ class YKPAR_OT_refresh(Operator):
             top.depth = 0
 
             try:
-                # read_par populates folder/file structure without decompressing file bytes
-                # Decompression can be expensive; we avoid it here and only decompress on import
+                # read_par with caching - now much faster on repeated calls
                 par = read_par(par_path)
+                
                 # cache root folder for UI tree rendering
                 try:
                     PAR_CACHE[par_path] = par.folders[0] if getattr(par, 'folders', None) and len(par.folders) else None
                 except Exception:
                     PAR_CACHE[par_path] = None
-
-                def walk(folder, prefix, depth):
-                    # If we're at the top-level, check allowed categories only when no filter is present
-                    if depth == 1 and not filter_text:
-                        if not _is_allowed_top_level(folder.name):
-                            return False
-
-                    found_any = False
-
-                    # If folder name itself matches the filter, treat the entire subtree as matched
-                    folder_name = (folder.name or '').lower()
-                    folder_matches = False
-                    if filter_text and filter_text in folder_name:
-                        folder_matches = True
-
-                    # files at this level
-                    for f in getattr(folder, 'files', []) or []:
-                        name = f.name or ''
-                        lname = name.lower()
-                        # Include .gmd, .par, and .gmt files so embedded PARs, GMDs, and GMTs are visible
-                        if not (lname.endswith('.gmd') or lname.endswith('.par') or lname.endswith('.gmt')):
-                            continue
-                        # If the folder matched, include all files under it; otherwise, match by filename
-                        if filter_text and not folder_matches and filter_text not in lname:
-                            # skip non-matching files when a filter is active and the folder didn't match
-                            continue
+                
+                # OPTIMIZATION: Defer search index building until first filtered search
+                # This significantly speeds up initial PAR load when no filter is active
+                # The index will be built on-demand during the first filtered search
+                
+                # Use optimized index-based search when filter is active
+                if filter_text:
+                    # Build index on first use (lazy initialization)
+                    if par_path not in _SEARCH_INDEX:
+                        _build_search_index(par_path, par)
+                    
+                    # Fast path: query pre-built index
+                    results = _query_search_index(par_path, filter_text)
+                    for name, internal_path, is_folder, depth in results:
                         it = scene.yk_par_nodes.add()
                         it.name = name
-                        it.internal_path = (prefix + name).lstrip('/')
+                        it.internal_path = internal_path
                         it.par_path = par_path
-                        it.is_folder = False
+                        it.is_folder = is_folder
                         it.depth = depth
-                        found_any = True
+                else:
+                    # No filter - use original tree walk (for compatibility)
+                    def walk(folder, prefix, depth):
+                        # If we're at the top-level, check allowed categories only when no filter is present
+                        if depth == 1 and not filter_text:
+                            if not _is_allowed_top_level(folder.name):
+                                return False
 
-                    # recurse into subfolders; only add folder entries if they or their descendants match filter
-                    for sub in getattr(folder, 'folders', []) or []:
-                        subname = sub.name or ''
-                        child_matched = walk(sub, prefix + subname + '/', depth + 1)
-                        if child_matched:
+                        found_any = False
+
+                        # If folder name itself matches the filter, treat the entire subtree as matched
+                        folder_name = (folder.name or '').lower()
+                        folder_matches = False
+                        if filter_text and filter_text in folder_name:
+                            folder_matches = True
+
+                        # files at this level
+                        for f in getattr(folder, 'files', []) or []:
+                            name = f.name or ''
+                            lname = name.lower()
+                            # Include .gmd, .par, and .gmt files so embedded PARs, GMDs, and GMTs are visible
+                            if not (lname.endswith('.gmd') or lname.endswith('.par') or lname.endswith('.gmt')):
+                                continue
+                            # If the folder matched, include all files under it; otherwise, match by filename
+                            if filter_text and not folder_matches and filter_text not in lname:
+                                # skip non-matching files when a filter is active and the folder didn't match
+                                continue
                             it = scene.yk_par_nodes.add()
-                            it.name = subname
-                            it.internal_path = (prefix + subname + '/').lstrip('/')
+                            it.name = name
+                            it.internal_path = (prefix + name).lstrip('/')
+                            it.par_path = par_path
+                            it.is_folder = False
+                            it.depth = depth
+                            found_any = True
+
+                        # recurse into subfolders; only add folder entries if they or their descendants match filter
+                        for sub in getattr(folder, 'folders', []) or []:
+                            subname = sub.name or ''
+                            child_matched = walk(sub, prefix + subname + '/', depth + 1)
+                            if child_matched:
+                                it = scene.yk_par_nodes.add()
+                                it.name = subname
+                                it.internal_path = (prefix + subname + '/').lstrip('/')
+                                it.par_path = par_path
+                                it.is_folder = True
+                                it.depth = depth
+                                found_any = True
+
+                        # If the folder itself matched but we found no files or matched children (e.g. empty folder),
+                        # still consider it matched so its presence is visible in the filtered listing.
+                        if folder_matches and not found_any:
+                            # add the folder marker (no files beneath matched or present)
+                            it = scene.yk_par_nodes.add()
+                            it.name = folder.name or ''
+                            it.internal_path = (prefix + (folder.name or '') + '/').lstrip('/')
                             it.par_path = par_path
                             it.is_folder = True
                             it.depth = depth
                             found_any = True
 
-                    # If the folder itself matched but we found no files or matched children (e.g. empty folder),
-                    # still consider it matched so its presence is visible in the filtered listing.
-                    if folder_matches and not found_any:
-                        # add the folder marker (no files beneath matched or present)
-                        it = scene.yk_par_nodes.add()
-                        it.name = folder.name or ''
-                        it.internal_path = (prefix + (folder.name or '') + '/').lstrip('/')
-                        it.par_path = par_path
-                        it.is_folder = True
-                        it.depth = depth
-                        found_any = True
+                        return found_any
 
-                    return found_any
-
-                root = par.folders[0] if getattr(par, 'folders', None) and len(par.folders) else None
-                if root:
-                    walk(root, '', 1)
+                    root = par.folders[0] if getattr(par, 'folders', None) and len(par.folders) else None
+                    if root:
+                        walk(root, '', 1)
             except Exception as e:
                 print(f"Failed to read PAR {par_path}: {e}")
 
@@ -2419,6 +2554,9 @@ class YKPAR_OT_import_selected(BaseImportGMD, Operator):
     bl_label = "Import Selected GMD"
 
     def execute(self, context):
+        # Ensure scene properties are registered before accessing them
+        _ensure_scene_properties()
+        
         scene = context.scene
         idx = scene.yk_par_node_index
         if idx < 0 or idx >= len(scene.yk_par_nodes):
@@ -2470,7 +2608,8 @@ class YKPAR_OT_import_selected(BaseImportGMD, Operator):
 
         # parse and import the GMD bytes using the centralized helper
         try:
-            file_bytes = bytes(target.data) if isinstance(target.data, (bytearray, memoryview)) else target.data
+            target_data = _get_file_data(target)
+            file_bytes = bytes(target_data) if isinstance(target_data, (bytearray, memoryview)) else target_data
             from .gmd_importers import import_gmd_bytes_to_collection
 
             # collect existing yakuza-created image names so we can compute the delta
@@ -2547,6 +2686,9 @@ class YKPAR_OT_place_selected(BaseImportGMD, Operator):
 
     def execute(self, context):
         # Import the selected file bytes and place the resulting collection at the 3D cursor
+        # Ensure scene properties are registered before accessing them
+        _ensure_scene_properties()
+        
         scene = context.scene
         idx = scene.yk_par_node_index
         if idx < 0 or idx >= len(scene.yk_par_nodes):
@@ -2594,7 +2736,8 @@ class YKPAR_OT_place_selected(BaseImportGMD, Operator):
             return {'CANCELLED'}
 
         try:
-            file_bytes = bytes(target.data) if isinstance(target.data, (bytearray, memoryview)) else target.data
+            target_data = _get_file_data(target)
+            file_bytes = bytes(target_data) if isinstance(target_data, (bytearray, memoryview)) else target_data
             from .gmd_importers import import_gmd_bytes_to_collection
 
             # collect existing yakuza-created image names so we can compute the delta
@@ -3027,7 +3170,7 @@ class YKPAR_OT_extract_textures_from_configured_par(Operator):
                 if not internal.lower().endswith('.dds'):
                     continue
                 try:
-                    data = decompress_file(f) if getattr(f, 'compression', 0) else f.data
+                    data = _get_file_data(f)
                     if isinstance(data, (bytearray, memoryview)):
                         data = bytes(data)
                     out_path = _safe_write_bytes(tmpdir, f.name, data)
@@ -3144,7 +3287,7 @@ class YKPAR_OT_extract_textures_from_par(Operator):
                 if not (getattr(f, 'name', '') or '').lower().endswith('.dds'):
                     continue
                 try:
-                    data = decompress_file(f) if getattr(f, 'compression', 0) else f.data
+                    data = _get_file_data(f)
                     if isinstance(data, (bytearray, memoryview)):
                         data = bytes(data)
                     _safe_write_bytes(tmpdir, f.name, data)
@@ -3241,7 +3384,7 @@ class YKPAR_OT_unpack_and_link_par(Operator):
 
             # Decompress embedded PAR bytes if necessary
             try:
-                data = decompress_file(target) if getattr(target, 'compression', 0) else target.data
+                data = _get_file_data(target)
                 if isinstance(data, (bytearray, memoryview)):
                     data = bytes(data)
             except Exception as e:
@@ -3298,7 +3441,7 @@ class YKPAR_OT_unpack_and_link_par(Operator):
                             for f in getattr(folder, 'files', []) or []:
                                 if (getattr(f, 'name', '') or '').lower().endswith('.dds'):
                                     try:
-                                        data = decompress_file(f) if getattr(f, 'compression', 0) else f.data
+                                        data = _get_file_data(f)
                                         if isinstance(data, (bytearray, memoryview)):
                                             data = bytes(data)
                                         _safe_write_bytes(tmpdir, f.name, data)
@@ -3348,7 +3491,7 @@ class YKPAR_OT_unpack_and_link_par(Operator):
                         if not (getattr(f, 'name', '') or '').lower().endswith('.dds'):
                             continue
                         try:
-                            data = decompress_file(f) if getattr(f, 'compression', 0) else f.data
+                            data = _get_file_data(f)
                             if isinstance(data, (bytearray, memoryview)):
                                 data = bytes(data)
                             _safe_write_bytes(tmpdir, f.name, data)
@@ -3455,7 +3598,7 @@ class YKPAR_OT_import_visible_all(BaseImportGMD, Operator):
                                 self.report({'WARNING'}, f'Failed to decompress file: {de}')
                                 continue
                         else:
-                            target_data = target.data
+                            target_data = _get_file_data(target)
 
                         file_bytes = bytes(target_data) if isinstance(target_data, (bytearray, memoryview)) else target_data
                         try:
@@ -3549,7 +3692,7 @@ class YKPAR_OT_import_gmt_from_par(Operator):
 
         # get raw bytes
         try:
-            data = decompress_file(target) if getattr(target, 'compression', 0) else target.data
+            data = _get_file_data(target)
             if isinstance(data, (bytearray, memoryview)):
                 data = bytes(data)
         except Exception as e:
@@ -3691,7 +3834,7 @@ class YKPAR_OT_import_par_armature(Operator):
                         self.report({'ERROR'}, f"Failed to decompress file: {de}")
                         return {'CANCELLED'}
                 else:
-                    target_data = target.data
+                    target_data = _get_file_data(target)
 
                 file_bytes = bytes(target_data) if isinstance(target_data, (bytearray, memoryview)) else target_data
                 from .gmd_importers import import_gmd_bytes_to_collection
@@ -3793,7 +3936,7 @@ class YKPAR_OT_import_par_animation(Operator):
                         self.report({'ERROR'}, f"Failed to decompress file: {de}")
                         return {'CANCELLED'}
                 else:
-                    target_data = target.data
+                    target_data = _get_file_data(target)
 
                 file_bytes = bytes(target_data) if isinstance(target_data, (bytearray, memoryview)) else target_data
 

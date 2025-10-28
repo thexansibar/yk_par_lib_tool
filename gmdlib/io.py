@@ -1,3 +1,5 @@
+from functools import lru_cache
+import hashlib
 from pathlib import Path
 from typing import Union, Tuple, cast
 
@@ -51,40 +53,68 @@ def get_file_header(data: Union[Path, str, bytes], error_reporter: ErrorReporter
     return base_header
 
 
-def read_gmd_structures(data: Union[Path, str, bytes], error_reporter: ErrorReporter) -> \
+def _compute_data_hash(data: bytes) -> str:
+    """Compute a hash of the data for caching purposes."""
+    return hashlib.md5(data).hexdigest()
+
+
+@lru_cache(maxsize=32)
+def _read_gmd_structures_cached(data_hash: str, data_len: int) -> \
         Tuple[VersionProperties, GMDHeaderStruct, Union[FileData_Kenzan, FileData_YK1]]:
-    data = _get_file_data(data, error_reporter)
+    """
+    Internal cached function. The cache key is (data_hash, data_len).
+    The actual data must be retrieved from the module-level _GMD_DATA_CACHE.
+    """
+    # This function is called by read_gmd_structures which has already stored the data
+    # We can't cache 'data' directly as bytes aren't hashable in a useful way for lru_cache
+    # Instead, we use the hash as the cache key and retrieve data from module cache
+    if data_hash not in _GMD_DATA_CACHE:
+        raise ValueError(f"Data hash {data_hash} not found in cache - this shouldn't happen")
+    
+    data = _GMD_DATA_CACHE[data_hash]
     big_endian, base_header = _extract_base_header(data)
 
     header: GMDHeaderStruct
 
     version_props = base_header.get_version_properties()
     if version_props.major_version == GMDVersion.Kiwami1:
-        try:
-            header, _ = GMDHeader_YK1_Unpack.unpack(big_endian, data=data, offset=0)
-            contents, _ = FilePacker_YK1.unpack(big_endian, data=data, offset=0)
-
-            return version_props, header, contents
-        except FileUnpackError as e:
-            error_reporter.fatal(str(e))
+        header, _ = GMDHeader_YK1_Unpack.unpack(big_endian, data=data, offset=0)
+        contents, _ = FilePacker_YK1.unpack(big_endian, data=data, offset=0)
+        return version_props, header, contents
     elif version_props.major_version == GMDVersion.Kenzan:
-        try:
-            header, _ = GMDHeader_Kenzan_Unpack.unpack(big_endian, data=data, offset=0)
-            contents, _ = FilePacker_Kenzan.unpack(big_endian, data=data, offset=0)
-
-            return version_props, header, contents
-        except FileUnpackError as e:
-            error_reporter.fatal(str(e))
+        header, _ = GMDHeader_Kenzan_Unpack.unpack(big_endian, data=data, offset=0)
+        contents, _ = FilePacker_Kenzan.unpack(big_endian, data=data, offset=0)
+        return version_props, header, contents
     elif version_props.major_version == GMDVersion.Dragon:
-        try:
-            header, _ = GMDHeader_Dragon_Unpack.unpack(big_endian, data=data, offset=0)
-            contents, _ = FilePacker_Dragon.unpack(big_endian, data=data, offset=0)
-
-            return version_props, header, contents
-        except FileUnpackError as e:
-            error_reporter.fatal(str(e))
+        header, _ = GMDHeader_Dragon_Unpack.unpack(big_endian, data=data, offset=0)
+        contents, _ = FilePacker_Dragon.unpack(big_endian, data=data, offset=0)
+        return version_props, header, contents
     else:
         raise InvalidGMDFormatError(f"File format version {version_props.version_str} is not readable")
+
+
+# Module-level cache to store GMD data by hash
+# LRU eviction is handled by the lru_cache decorator on _read_gmd_structures_cached
+_GMD_DATA_CACHE = {}
+
+
+def read_gmd_structures(data: Union[Path, str, bytes], error_reporter: ErrorReporter) -> \
+        Tuple[VersionProperties, GMDHeaderStruct, Union[FileData_Kenzan, FileData_YK1]]:
+    """
+    Parse GMD structures from file or bytes. Results are cached for performance.
+    Cache key is based on data hash and length.
+    """
+    data = _get_file_data(data, error_reporter)
+    data_hash = _compute_data_hash(data)
+    data_len = len(data)
+    
+    # Store data in module cache (will be evicted when LRU cache evicts the corresponding entry)
+    _GMD_DATA_CACHE[data_hash] = data
+    
+    try:
+        return _read_gmd_structures_cached(data_hash, data_len)
+    except FileUnpackError as e:
+        error_reporter.fatal(str(e))
 
 
 def read_abstract_scene_from_filedata_object(version_props: VersionProperties, file_import_mode: FileImportMode,

@@ -24,6 +24,33 @@ class File:
     timestamp: int
 
     data: bytearray
+    
+    # Lazy loading support (private attributes)
+    _reader: 'BinaryReader' = None
+    _data_offset: int = 0
+    _data_size: int = 0
+    _data_loaded: bool = False
+    
+    def _ensure_data_loaded(self):
+        """Lazy load file data when first accessed."""
+        if self._data_loaded or self.data is not None:
+            return
+        if self._reader is None:
+            return  # No reader available, data must be set directly
+        
+        # Read file data on-demand
+        self._reader.push()
+        try:
+            self._reader.seek(self._data_offset)
+            self.data = bytearray(self._reader.read_bytes(self._data_size))
+            self._data_loaded = True
+        finally:
+            self._reader.pop()
+    
+    def get_data(self):
+        """Get file data, loading lazily if needed."""
+        self._ensure_data_loaded()
+        return self.data
 
 
 class Directory:

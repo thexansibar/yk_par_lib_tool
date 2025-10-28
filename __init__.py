@@ -2,7 +2,7 @@
 bl_info = {
     "name": "Yakuza PAR Viewer/Importer",
     "author": "xansibar",
-    "version": (0, 1, 0),
+    "version": (0, 2, 5),
     "blender": (4, 0, 0),
     "location": "File > Import-Export",
     "description": ".Par Library Viewer/Importer",
