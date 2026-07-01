@@ -63,6 +63,8 @@ def import_gmd_bytes_to_collection(context, file_label: str, file_bytes: bytes, 
     # prepare a filepath for scene creators so material loader can search gmd_folder
     filepath_for_creator = os.path.join(gmd_folder, file_label) if gmd_folder else file_label
 
+    skinned_error = None
+
     # try skinned
     if prefer_skinned:
         try:
@@ -75,17 +77,22 @@ def import_gmd_bytes_to_collection(context, file_label: str, file_bytes: bytes, 
             gmd_armature = scene_creator.make_bone_hierarchy(context, gmd_collection)
             scene_creator.make_objects(context, gmd_collection, gmd_armature)
             return gmd_collection
-        except Exception:
-            pass
+        except Exception as ex:
+            skinned_error = ex
 
     # try unskinned
-    gmd_scene = read_abstract_scene_from_filedata_object(gmd_version, FileImportMode.UNSKINNED,
-                                                         VertexImportMode.IMPORT_VERTICES, gmd_contents, error)
-    scene_creator = GMDUnskinnedSceneCreator(filepath_for_creator, gmd_scene, config, error)
-    scene_creator.validate_scene()
-    gmd_collection = scene_creator.make_collection(context)
-    scene_creator.make_objects(context, gmd_collection)
-    return gmd_collection
+    try:
+        gmd_scene = read_abstract_scene_from_filedata_object(gmd_version, FileImportMode.UNSKINNED,
+                                                             VertexImportMode.IMPORT_VERTICES, gmd_contents, error)
+        scene_creator = GMDUnskinnedSceneCreator(filepath_for_creator, gmd_scene, config, error)
+        scene_creator.validate_scene()
+        gmd_collection = scene_creator.make_collection(context)
+        scene_creator.make_objects(context, gmd_collection)
+        return gmd_collection
+    except Exception as ex:
+        if skinned_error is not None:
+            raise skinned_error from ex
+        raise
 from ...gmdlib.structure.version import VersionProperties, GMDVersion
 
 
@@ -196,6 +203,8 @@ class BaseImportGMD:
         except Exception as e:
             error.fatal(f"Failed to parse GMD bytes for {file_label}: {e}")
 
+        skinned_error = None
+
         # try skinned first if requested
         if prefer_skinned:
             try:
@@ -209,9 +218,9 @@ class BaseImportGMD:
                 gmd_armature = scene_creator.make_bone_hierarchy(context, gmd_collection)
                 scene_creator.make_objects(context, gmd_collection, gmd_armature)
                 return gmd_collection
-            except Exception:
-                # fall through to try unskinned
-                pass
+            except Exception as ex:
+                # fall through to try unskinned, but preserve the original error
+                skinned_error = ex
 
         # try unskinned
         try:
@@ -225,6 +234,8 @@ class BaseImportGMD:
             scene_creator.make_objects(context, gmd_collection)
             return gmd_collection
         except Exception as e:
+            if skinned_error is not None:
+                error.fatal(f"Failed to create scene for {file_label}: {skinned_error}")
             error.fatal(f"Failed to create scene for {file_label}: {e}")
 
 

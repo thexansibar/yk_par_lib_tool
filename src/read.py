@@ -75,15 +75,11 @@ def _read_par_impl(path: str) -> Par:
     for i in range(names_count):
         names.append(reader.read_str(64))
 
-    # folders - batch read folder metadata
+    # folders
     folders: List[Folder] = []
     reader.push()
     reader.seek(header.folder_offset)
-    
-    # Read all folder data in one go for better cache locality
-    folder_struct_size = 32  # 4+4+4+4+4+12 bytes per folder
-    folder_data_size = header.folder_count * folder_struct_size
-    
+
     for i in range(header.folder_count):
         folder = Folder()
         folder.name = names[i]
@@ -96,7 +92,7 @@ def _read_par_impl(path: str) -> Par:
         folders.append(folder)
     reader.pop()
 
-    # files - batch read file metadata
+    # files
     files: List[File] = []
     reader.push()
     reader.seek(header.file_offset)
@@ -129,5 +125,12 @@ def _read_par_impl(path: str) -> Par:
     for f in par.folders:
         f.files = par.files[f.file_start: f.file_start + f.file_count]
         f.folders = par.folders[f.folder_start: f.folder_start + f.folder_count]
+        # Prebuild indexes so first lookup is O(1)
+        if hasattr(f, "_ensure_name_indexes"):
+            f._ensure_name_indexes()
+
+    # Prebuild top-level indexes so search paths don't pay first-call setup cost
+    if hasattr(par, "_ensure_name_indexes"):
+        par._ensure_name_indexes()
 
     return par
