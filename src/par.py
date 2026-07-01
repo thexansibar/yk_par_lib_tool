@@ -57,31 +57,30 @@ class Directory:
     files: List[File]
     folders: List['Folder']
 
+    def _ensure_name_indexes(self) -> None:
+        if not hasattr(self, "_file_index"):
+            self._file_index = {f.name: f for f in self.files}
+        if not hasattr(self, "_folder_index"):
+            self._folder_index = {f.name: f for f in self.folders}
+
     def get_file(self, file_name: str) -> File:
         """searches for the file in this directory.
         if the directory is a par, searches in all files of the par."""
-
-        file = [f for f in self.files if f.name == file_name]
-        if len(file):
-            return file[0]
-        return None
+        self._ensure_name_indexes()
+        return self._file_index.get(file_name)
 
     def get_folder(self, folder_name: str) -> 'Folder':
         """searches for the folder in this directory.
         if the directory is a par, searches in all folders of the par."""
-
-        folder = [f for f in self.folders if f.name == folder_name]
-        if len(folder):
-            return folder[0]
-        return None
+        self._ensure_name_indexes()
+        return self._folder_index.get(folder_name)
 
     def __file_from_path(self, paths: List[str], file_name: str) -> File:
-        if len(paths):
-            folder = self.get_folder(paths.pop(0))
-            if folder:
-                return folder.__file_from_path(paths, file_name)
-        else:
+        if not paths:
             return self.get_file(file_name)
+        folder = self.get_folder(paths[0])
+        if folder:
+            return folder.__file_from_path(paths[1:], file_name)
         return None
 
     def get_file_from_path(self, path: str, par_root=False) -> File:

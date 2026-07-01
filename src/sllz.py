@@ -3,8 +3,8 @@ from .util.binary import BinaryReader
 import zlib
 
 # Toggle to True for verbose decompression diagnostics (prints sizes and header hex)
-# Enabled by default to aid debugging of small/malformed DDS outputs during imports.
-DEBUG_SLLZ = True
+# Disabled by default for faster bulk imports; enable when debugging only.
+DEBUG_SLLZ = False
 
 
 def enable_sllz_debug(enable: bool = True) -> None:
@@ -154,6 +154,7 @@ def decompress_v2(reader: BinaryReader, compressed_size: int, decompressed_size:
     # Many implementations read (compressed_size - 0x10) bytes into the processing buffer
     start = reader.pos()
     in_buf = bytearray(reader.buffer()[start: start + max(0, compressed_size - 0x10)])
+    in_view = memoryview(in_buf)
     out_buf = bytearray(decompressed_size)
 
     in_pos = 0
@@ -173,7 +174,7 @@ def decompress_v2(reader: BinaryReader, compressed_size: int, decompressed_size:
             comp_len = compressed_chunk_size - 5
             if comp_start + comp_len > len(in_buf):
                 raise Exception("SLLZ v2: Compressed chunk extends beyond input buffer")
-            comp_slice = bytes(in_buf[comp_start: comp_start + comp_len])
+            comp_slice = in_view[comp_start: comp_start + comp_len]
             try:
                 decompressed_data = zlib.decompress(comp_slice)
             except Exception as e:

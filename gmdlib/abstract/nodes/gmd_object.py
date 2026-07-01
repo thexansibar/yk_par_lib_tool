@@ -113,5 +113,8 @@ class GMDSkinnedObject(GMDNode):
 
     def add_mesh(self, mesh: GMDSkinnedMesh):
         if not isinstance(mesh, GMDSkinnedMesh):
-            raise TypeError(f"GMDSkinnedObject {self.name} got not-skinned-mesh {mesh}")
+            # Some files contain mixed/invalid drawlists where skinned nodes reference unskinned meshes.
+            # Skip these meshes so import can continue instead of aborting.
+            print(f"[YKGMD] [INFO ] Skipping non-skinned mesh on skinned object {self.name}: {mesh}")
+            return
         self.mesh_list.append(mesh)

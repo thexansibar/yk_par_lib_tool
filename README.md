@@ -9,9 +9,9 @@ Uses gmd-io baked in, thanks TurboTurnip for the io functionality and NotYoshi f
 2. when you select a .gmd you want, it will import and create a folder and only import the textures that are linked to the related gmd. (they will autolink!) They also come with their _l counterparts.
 3. done!
 
-## What I need from you:
-1. Test it out! I know this is not a perfect tool but with your input i can fix the problems as they develop.
-2. let me know what you think and provide feedback on the ui, speed, and ease of use.
+## Whats new:
+1. You can import stages! (xan's note: i would advise against this if you dont have a beefy PC, but i did work exceptionally hard on nested par searching so if you wanna go crazy I'm not gonna stop you)
+2. its kinda faster? (xan's note: its difficult to optimize a task like this as its unpacking only the files you need in real-time, if you open the console you can see it working exceptionally fast! I think the pars themselves can be unpacked faster, but I need to do more digging if i get more free time again)
 
 
 ### Special Thanks to:

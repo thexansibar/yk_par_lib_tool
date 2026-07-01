@@ -127,8 +127,11 @@ class GMDSkinnedMesh(GMDMesh):
 
     def __post_init__(self):
         super().__post_init__()
+        # Convert bone indices to a signed integer type so sentinel -1 values are preserved.
+        # If we keep uint8 here, np.where(..., -1) becomes 255 and triggers false validation failures.
+        signed_bone_data = self.vertices_data.bone_data.astype(np.int16, copy=False)
         referenced_bone_indices = set(np.unique(
-            np.where(self.vertices_data.weight_data > 0, self.vertices_data.bone_data, -1)).flatten())
+            np.where(self.vertices_data.weight_data > 0, signed_bone_data, -1)).flatten().tolist())
         referenced_bone_indices.discard(-1)
         # This is allowed: under non-strict circumstances,
         # particularly with GMDVertexBufferLayout.force_bpv_positions_only,

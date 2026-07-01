@@ -474,7 +474,19 @@ class GMDAbstractor_Common(abc.ABC, Generic[TFileData]):
                         f"{[node.name for node in relevant_bones if not isinstance(node, GMDBone)]}")
 
                 if self.file_import_mode == FileImportMode.UNSKINNED:
-                    self.error.fatal("Found mesh with a matrixlist in an unskinned file - can't import this yet")
+                    self.error.info(
+                        "Found mesh with a matrixlist in an unskinned import; "
+                        "ignoring matrixlist and importing mesh as unskinned")
+                    meshes.append(GMDMesh(
+                        empty=(self.vertex_import_mode == VertexImportMode.NO_VERTICES),
+
+                        vertices_data=vertex_buffer.copy_as_generic(vertex_slice),
+
+                        triangles=triangles,
+
+                        attribute_set=abstract_attributes[mesh_struct.attribute_index]
+                    ))
+                    continue
 
                 meshes.append(GMDSkinnedMesh(
                     empty=(self.vertex_import_mode == VertexImportMode.NO_VERTICES),
@@ -488,6 +500,25 @@ class GMDAbstractor_Common(abc.ABC, Generic[TFileData]):
                     attribute_set=abstract_attributes[mesh_struct.attribute_index]
                 ))
             else:
+                if self.file_import_mode == FileImportMode.SKINNED and \
+                        vertex_buffer.bone_data is not None and vertex_buffer.weight_data is not None:
+                    self.error.info(
+                        "Found mesh without a matrixlist in skinned import; "
+                        "using all bones as a fallback palette")
+                    all_bones = [node for node in abstract_nodes_ordered if isinstance(node, GMDBone)]
+                    meshes.append(GMDSkinnedMesh(
+                        empty=(self.vertex_import_mode == VertexImportMode.NO_VERTICES),
+
+                        relevant_bones=all_bones,
+
+                        vertices_data=vertex_buffer.copy_as_skinned(vertex_slice),
+
+                        triangles=triangles,
+
+                        attribute_set=abstract_attributes[mesh_struct.attribute_index]
+                    ))
+                    continue
+
                 meshes.append(GMDMesh(
                     empty=(self.vertex_import_mode == VertexImportMode.NO_VERTICES),
 
@@ -535,5 +566,9 @@ class GMDAbstractor_Common(abc.ABC, Generic[TFileData]):
                             f"Object {abstract_node.name} specifies an unexpected material/mesh pair in it's drawlist "
                             f"that doesn't match the mesh's requested material")
 
-                    abstract_node.add_mesh(abstract_mesh)
+                    try:
+                        abstract_node.add_mesh(abstract_mesh)
+                    except TypeError as ex:
+                        self.error.info(
+                            f"Skipping incompatible mesh {mesh_idx} for object {abstract_node.name}: {ex}")
                     pass
