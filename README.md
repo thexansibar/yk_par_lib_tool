@@ -13,8 +13,10 @@ Uses gmd-io baked in, thanks TurboTurnip for the io functionality and NotYoshi f
 1. You can import stages! (xan's note: i would advise against this if you dont have a beefy PC, but i did work exceptionally hard on nested par searching so if you wanna go crazy I'm not gonna stop you)
 2. its kinda faster? (xan's note: its difficult to optimize a task like this as its unpacking only the files you need in real-time, if you open the console you can see it working exceptionally fast! I think the pars themselves can be unpacked faster, but I need to do more digging if i get more free time again)
 
-Special Thanks to:
-@Ret-HZ for the idea to utilize the Python PAR reader by @mosamadeeb
-@theturboturnip for the IO that reads and imports the GMDs 
-@NotYoshi for Neo Yakuza for easy texture linking
-@Mugen for testing modding capabilities.
+
+### Special Thanks to:
+- @Ret-HZ for the idea to utilize the Python PAR reader by @mosamadeeb
+- @theturboturnip for the IO that reads and imports the GMDs 
+- @NotYoshi for Neo Yakuza for easy texture linking
+- @Fronklin (Jhrino) and @sutandotsukai181 for .gmt import / export functionality.
+- @Mugen for testing
